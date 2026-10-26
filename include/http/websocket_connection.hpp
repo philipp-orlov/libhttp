@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -97,10 +98,12 @@ public:
         if (sendBufferFunction_)
             sendBufferFunction_(std::move(frame), binary);
     }
-    void close()
+    // Starts the closing handshake with a status code (RFC 6455 section 7.4)
+    // and a reason of at most 123 bytes. Loop thread only, like send().
+    void close(uint16_t code = 1000, std::string_view reason = {})
     {
         if (closeFunction_)
-            closeFunction_();
+            closeFunction_(code, reason);
     }
 
     // The sub-protocol the handshake agreed on ("" if none) and whatever the
@@ -136,7 +139,7 @@ public:
     {
         sendBufferFunction_ = std::move(sendBufferFunction);
     }
-    void bindCloseFunction(std::function<void()> closeFunction)
+    void bindCloseFunction(std::function<void(uint16_t, std::string_view)> closeFunction)
     {
         closeFunction_ = std::move(closeFunction);
     }
@@ -172,7 +175,7 @@ private:
     CloseHandler onClose_;
     std::function<void(std::string_view, bool)> sendFunction_;
     std::function<void(Buffer&&, bool)> sendBufferFunction_;
-    std::function<void()> closeFunction_;
+    std::function<void(uint16_t, std::string_view)> closeFunction_;
     std::string subprotocol_;
     std::shared_ptr<void> userData_;
     std::mutex postMutex_;

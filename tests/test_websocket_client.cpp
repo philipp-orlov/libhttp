@@ -70,7 +70,12 @@ struct EchoServer
         server = std::make_unique<http::Server>(config);
         server->onWebSocket("/echo", [this](std::shared_ptr<http::WebSocketConnection> c) {
             http::WebSocketConnection* raw = c.get();
-            c->onMessage([raw](std::string_view data, bool binary) { raw->send(data, binary); });
+            c->onMessage([raw](std::string_view data, bool binary) {
+                if (data == "close-with-policy")
+                    raw->close(1008, "policy violation");
+                else
+                    raw->send(data, binary);
+            });
             sockets.push_back(c);
         });
         http::WebSocketRouteOptions guarded;
@@ -199,6 +204,21 @@ void timeoutsAndPings()
     client.sendText("after pings");
     reply = client.receive(std::chrono::steady_clock::now() + 2s);
     expect(reply && reply->data == "after pings", "pongs are not messages");
+}
+
+void closeCodes()
+{
+    EchoServer s;
+    WebSocketClient client;
+    client.connect(url(s.config.port));
+    client.sendText("close-with-policy");
+    bool closed = false;
+    try {
+        client.receive(std::chrono::steady_clock::now() + 5s);
+    } catch (const WebSocketError& e) {
+        closed = e.kind() == WebSocketError::Kind::Closed && e.closeCode() == 1008 && e.closeReason() == "policy violation";
+    }
+    expect(closed, "close(code, reason) reaches the client");
 }
 
 void sendFromAnotherThread()
@@ -357,6 +377,7 @@ int main()
     echoSizes();
     handshakeRefusals();
     timeoutsAndPings();
+    closeCodes();
     sendFromAnotherThread();
     fragmentsPingsAndCloses();
     warmAllocations();

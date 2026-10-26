@@ -1012,9 +1012,9 @@ private:
             if (connectionGeneration_ == generation && !closing_)
                 sendWebSocketBuffer(std::move(frame), binary);
         });
-        webSocketConnection_->bindCloseFunction([this, generation]() {
+        webSocketConnection_->bindCloseFunction([this, generation](uint16_t code, std::string_view reason) {
             if (connectionGeneration_ == generation && !closing_)
-                closeWebSocketConnection();
+                closeWebSocketConnection(code, reason);
         });
         // Called from any thread, so it reads nothing of the Session: the
         // connection drops it (under its own lock) when it closes, and the
@@ -1447,14 +1447,19 @@ private:
         return false;
     }
 
-    void closeWebSocketConnection(uint16_t code = 1000)
+    void closeWebSocketConnection(uint16_t code = 1000, std::string_view reason = {})
     {
         if (closing_ || webSocketClosing_)
             return;
 
         webSocketClosing_ = true;
-        const char codeBytes[2] = {static_cast<char>(code >> 8), static_cast<char>(code & 0xff)};
-        sendWebSocketFrameRaw(std::string_view(codeBytes, 2), WsOpcode::Close);
+        char payload[125];
+        payload[0] = static_cast<char>(code >> 8);
+        payload[1] = static_cast<char>(code & 0xff);
+        const size_t reasonSize = std::min<size_t>(reason.size(), 123);
+        if (reasonSize)
+            std::memcpy(payload + 2, reason.data(), reasonSize);
+        sendWebSocketFrameRaw(std::string_view(payload, 2 + reasonSize), WsOpcode::Close);
         if (!closing_ && timeoutTimerId_) {
             loop_.refreshTimer(timeoutTimerId_, std::chrono::seconds(5));
             timerDue_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
