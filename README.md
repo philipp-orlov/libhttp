@@ -95,8 +95,9 @@ block returns to its pool once written.
 `http::WebSocketClient` (`http/websocket_client.hpp`) is a synchronous client for the same protocol: `connect("ws://host:port/path", options)`
 (extra headers, offered sub-protocols, connect timeout, message limit), `sendBinary`/`sendText`/`ping` from any thread,
 and `receive(deadline, pingEvery)`, which answers the server's pings, reassembles fragments, pings on silence and returns
-an 8-aligned view of the next message. A warm connection allocates nothing per message. `wss://` is not supported yet
-(`connect` throws `WebSocketError::Kind::Tls`); the client is POSIX-only for now.
+an 8-aligned view of the next message. A warm connection allocates nothing per message. `wss://` works in a
+build with `HTTP_WITH_SSL`: the certificate chain and the host name (or IP) are verified against `caFile` or the system's
+roots (`insecureSkipVerify` is for tests); without it `connect` throws `WebSocketError::Kind::Tls`. The client is POSIX-only for now.
 
 ## JSON
 
