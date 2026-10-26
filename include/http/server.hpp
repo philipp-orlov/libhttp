@@ -171,6 +171,8 @@ public:
     Server& onStaticFiles(std::string urlPrefix, std::string rootDir,
                           StaticFileHandler::Options options);
     Server& onWebSocket(std::string pattern, WebSocketHandler handler);
+    // The same with a per-route accept hook, sub-protocols and limits.
+    Server& onWebSocket(std::string pattern, WebSocketHandler handler, WebSocketRouteOptions options);
     // GET only: a long-lived, server-push response (see streaming_connection.hpp).
     Server& onStream(std::string pattern, StreamHandler handler);
 
@@ -241,7 +243,12 @@ private:
     Router router_;
     std::vector<StaticFileHandler> staticHandlers_;
     std::function<void(HttpContext&)> notFound_;
-    RouteTable<WebSocketHandler> webSocketRoutes_;
+    struct WebSocketRoute
+    {
+        WebSocketHandler handler;
+        WebSocketRouteOptions options;
+    };
+    RouteTable<WebSocketRoute> webSocketRoutes_;
     RouteTable<StreamHandler> streamRoutes_;
 
     mutable std::mutex poolMutex_;

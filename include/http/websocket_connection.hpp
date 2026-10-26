@@ -11,7 +11,44 @@
 #include <utility>
 #include <vector>
 
+#include "http/buffer.hpp"
+#include "http/http_types.hpp"
+
 namespace http {
+
+// What a WebSocket route's accept hook sees of the handshake. Valid during
+// the hook only.
+struct WebSocketHandshakeRequest
+{
+    const HttpRequest& request;  // method, path, headers (request.headers.get(name))
+    std::string_view remoteAddress;
+    const std::vector<std::pair<std::string, std::string>>& routeParams;
+};
+
+// What the accept hook decides.
+struct WebSocketAccept
+{
+    int status = 101;          // anything else refuses the handshake with that status
+    std::string subprotocol;   // echoed in Sec-WebSocket-Protocol when it was offered; empty = none
+    std::shared_ptr<void> userData;  // handed to the handler as WebSocketConnection::userData()
+};
+
+// Per-route settings for Server::onWebSocket.
+struct WebSocketRouteOptions
+{
+    // Unset: every handshake is accepted.
+    std::function<WebSocketAccept(const WebSocketHandshakeRequest&)> accept;
+    // If non-empty the client must offer one of these in Sec-WebSocket-Protocol
+    // (else 400); the first of the client's offers that is listed is chosen.
+    std::vector<std::string> subprotocols;
+    // 0 = ServerConfig::maxWebSocketMessageBytes (the larger of a route's
+    // value and the server's is never exceeded: a route can only tighten or,
+    // up to 16 MiB, raise the limit for its own connections).
+    size_t maxMessageBytes = 0;
+    // 0 = ServerConfig::keepAliveTimeoutSeconds. Any frame from the client
+    // (a ping included) restarts it.
+    int idleTimeoutSeconds = 0;
+};
 
 // User-facing handle for one upgraded WebSocket connection. The
 // send/close implementations are injected by the owning connection
@@ -52,10 +89,28 @@ public:
     {
         send(std::string_view(reinterpret_cast<const char*>(data), length), binary);
     }
+    // Loop thread only, like send(string_view): queues the pooled block itself,
+    // with no copy at any size, and returns it to its pool once written. The
+    // frame's order relative to other sends is kept.
+    void send(Buffer&& frame, bool binary = true)
+    {
+        if (sendBufferFunction_)
+            sendBufferFunction_(std::move(frame), binary);
+    }
     void close()
     {
         if (closeFunction_)
             closeFunction_();
+    }
+
+    // The sub-protocol the handshake agreed on ("" if none) and whatever the
+    // route's accept hook returned in WebSocketAccept::userData.
+    const std::string& subprotocol() const { return subprotocol_; }
+    const std::shared_ptr<void>& userData() const { return userData_; }
+    void setHandshake(std::string subprotocol, std::shared_ptr<void> userData)
+    {
+        subprotocol_ = std::move(subprotocol);
+        userData_ = std::move(userData);
     }
 
     std::string_view routeParam(std::string_view name) const
@@ -76,6 +131,10 @@ public:
     void bindSendFunction(std::function<void(std::string_view, bool)> sendFunction)
     {
         sendFunction_ = std::move(sendFunction);
+    }
+    void bindSendBufferFunction(std::function<void(Buffer&&, bool)> sendBufferFunction)
+    {
+        sendBufferFunction_ = std::move(sendBufferFunction);
     }
     void bindCloseFunction(std::function<void()> closeFunction)
     {
@@ -100,7 +159,9 @@ public:
         onMessage_ = nullptr;
         onClose_ = nullptr;
         sendFunction_ = nullptr;
+        sendBufferFunction_ = nullptr;
         closeFunction_ = nullptr;
+        userData_ = nullptr;
         // post() runs on other threads: the one callback dropped under the lock.
         std::lock_guard<std::mutex> lock(postMutex_);
         postFunction_ = nullptr;
@@ -110,7 +171,10 @@ private:
     MessageHandler onMessage_;
     CloseHandler onClose_;
     std::function<void(std::string_view, bool)> sendFunction_;
+    std::function<void(Buffer&&, bool)> sendBufferFunction_;
     std::function<void()> closeFunction_;
+    std::string subprotocol_;
+    std::shared_ptr<void> userData_;
     std::mutex postMutex_;
     std::function<bool(std::function<void()>)> postFunction_;
     std::vector<std::pair<std::string, std::string>> routeParams_;

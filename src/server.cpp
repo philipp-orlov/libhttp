@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "http/server.hpp"
+#include "ws_out_queue.hpp"
 
 #include <cstring>
 #include <deque>
@@ -277,6 +278,9 @@ public:
         webSocketCorkedFrames_ = 0;
         webSocketInFlightFrames_ = 0;
         webSocketPartialBytes_ = 0;
+        outFrames_.clear();
+        webSocketMaxMessageBytes_ = server_.config().maxWebSocketMessageBytes;
+        webSocketIdleSeconds_ = server_.config().keepAliveTimeoutSeconds;
         webSocketClosing_ = false;
         webSocketPendingMessage_.clear();
         webSocketPendingOpcode_ = WsOpcode::Text;
@@ -554,10 +558,10 @@ private:
         std::vector<std::pair<std::string, std::string>>& params = routeParams_;
         params.clear();
         if (request_.isUpgrade && request_.upgradeTo == "websocket") {
-            const WebSocketHandler* handler =
+            const Server::WebSocketRoute* route =
                 server_.webSocketRoutes_.match(HttpMethod::Get, request_.path, params);
-            if (handler) {
-                upgradeToWebSocket(*handler, std::move(params));
+            if (route) {
+                upgradeToWebSocket(*route, std::move(params));
                 return;
             }
         }
@@ -718,6 +722,10 @@ private:
             return;
 
         if (writeData_.empty()) {
+            if (!outFrames_.empty()) {
+                writeOutFrames();
+                return;
+            }
             if (hasLargeBody())
                 writeLargeBody();
 
@@ -761,6 +769,55 @@ private:
                                 [this](IoResult result) { onWriteComplete(result); });
     }
 
+    // Gives the queued pooled frames to the socket in order, header and payload
+    // in place. What the socket takes at once is dropped from the queue; for
+    // the rest one asynchronous write at a time is started, and the frame
+    // stays at the front (its block alive) until that write completes.
+    void writeOutFrames()
+    {
+        while (!outFrames_.empty()) {
+            internal::OutFrame& f = outFrames_.front();
+            const size_t headerLeft = f.sent < f.headerSize ? f.headerSize - f.sent : 0;
+            const size_t bodyDone = f.sent > f.headerSize ? f.sent - f.headerSize : 0;
+            const unsigned char* header = reinterpret_cast<const unsigned char*>(f.header) + (f.headerSize - headerLeft);
+            const unsigned char* body = f.payload.data() + bodyDone;
+            const size_t bodyLeft = f.payload.size() - bodyDone;
+            const size_t sent = connection_->tryWrite(header, headerLeft, body, bodyLeft);
+            outFrames_.advance(sent);
+            if (sent >= headerLeft + bodyLeft) {
+                outFrames_.pop();
+                continue;
+            }
+            // The socket is full: write what is left asynchronously.
+            writeInFlight_ = true;
+            const size_t headerNow = sent < headerLeft ? headerLeft - sent : 0;
+            if (headerNow > 0) {
+                pendingWrite_.assign(reinterpret_cast<const char*>(header) + sent, headerNow);
+                connection_->asyncWrite(reinterpret_cast<const unsigned char*>(pendingWrite_.data()), headerNow,
+                                        [this, headerNow](IoResult result) {
+                                            if (!closing_ && result.ok)
+                                                outFrames_.advance(headerNow);
+                                            onWriteComplete(result);
+                                        });
+            } else {
+                const size_t done = sent > headerLeft ? sent - headerLeft : 0;
+                const size_t left = bodyLeft - done;
+                connection_->asyncWrite(body + done, left, [this, left](IoResult result) {
+                    if (!closing_ && result.ok) {
+                        outFrames_.advance(left);
+                        outFrames_.pop();
+                    }
+                    onWriteComplete(result);
+                });
+            }
+            return;
+        }
+        // Everything is on the socket.
+        resetTimeout();
+        if (isWebSocket_ && webSocketClosing_ && writeData_.empty() && !writeInFlight_)
+            closeAndCleanup();
+    }
+
     bool hasLargeBody() const { return !largeBody_.empty() || !largePooledBody_.empty(); }
 
     std::string_view largeBody() const
@@ -801,7 +858,7 @@ private:
         }
         resetTimeout();
         webSocketInFlightFrames_ = 0;
-        if (!writeData_.empty()) {
+        if (!writeData_.empty() || !outFrames_.empty()) {
             flush();
             return;
         }
@@ -859,7 +916,7 @@ private:
 
     // --- WebSocket path ---
 
-    void upgradeToWebSocket(const WebSocketHandler& handler,
+    void upgradeToWebSocket(const Server::WebSocketRoute& route,
                             std::vector<std::pair<std::string, std::string>> params)
     {
         std::string_view key = request_.headers.get("Sec-WebSocket-Key");
@@ -880,6 +937,52 @@ private:
             sendResponse();
             return;
         }
+        // Sub-protocol: the first of the client's offers the route lists.
+        std::string chosen;
+        if (!route.options.subprotocols.empty()) {
+            std::string_view offers = request_.headers.get("Sec-WebSocket-Protocol");
+            while (!offers.empty() && chosen.empty()) {
+                const size_t comma = offers.find(',');
+                std::string_view token = offers.substr(0, comma);
+                while (!token.empty() && (token.front() == ' ' || token.front() == '\t'))
+                    token.remove_prefix(1);
+                while (!token.empty() && (token.back() == ' ' || token.back() == '\t'))
+                    token.remove_suffix(1);
+                for (const std::string& listed : route.options.subprotocols)
+                    if (chosen.empty() && listed == token)
+                        chosen = listed;
+                offers = comma == std::string_view::npos ? std::string_view() : offers.substr(comma + 1);
+            }
+            if (chosen.empty()) {
+                context_.status(400).text("Bad Request: unsupported WebSocket sub-protocol");
+                sendResponse();
+                return;
+            }
+        }
+        std::shared_ptr<void> userData;
+        if (route.options.accept) {
+            WebSocketAccept decision;
+            try {
+                decision = route.options.accept(
+                    WebSocketHandshakeRequest{request_, context_.remoteAddress(), params});
+            } catch (...) {
+                decision.status = 500;
+            }
+            if (decision.status != 101) {
+                context_.status(decision.status).text(reasonPhrase(decision.status));
+                sendResponse();
+                return;
+            }
+            userData = std::move(decision.userData);
+            if (!decision.subprotocol.empty() && decision.subprotocol == chosen)
+                chosen = decision.subprotocol;
+        }
+        webSocketMaxMessageBytes_ = route.options.maxMessageBytes
+                                        ? std::min<size_t>(route.options.maxMessageBytes, 16u * 1024 * 1024)
+                                        : server_.config().maxWebSocketMessageBytes;
+        webSocketIdleSeconds_ = route.options.idleTimeoutSeconds > 0
+                                    ? route.options.idleTimeoutSeconds
+                                    : server_.config().keepAliveTimeoutSeconds;
         std::string accept = computeWebSocketAccept(key);
 
         writeData_ += "HTTP/1.1 101 Switching Protocols\r\n";
@@ -887,11 +990,16 @@ private:
         writeData_ += "Connection: Upgrade\r\n";
         writeData_ += "Sec-WebSocket-Accept: ";
         writeData_ += accept;
+        if (!chosen.empty()) {
+            writeData_ += "\r\nSec-WebSocket-Protocol: ";
+            writeData_ += chosen;
+        }
         writeData_ += "\r\n\r\n";
 
         webSocketConnection_ = std::make_shared<WebSocketConnection>();
         webSocketConnection_->setRouteParams(std::move(params));
         webSocketConnection_->setRemoteAddress(context_.remoteAddress());
+        webSocketConnection_->setHandshake(std::move(chosen), std::move(userData));
         // The handle a handler keeps may outlive this connection; a call
         // through it after that -- or after this Session moved on to another
         // connection -- must do nothing.
@@ -899,6 +1007,10 @@ private:
         webSocketConnection_->bindSendFunction([this, generation](std::string_view data, bool binary) {
             if (connectionGeneration_ == generation && !closing_)
                 sendWebSocketFrame(data, binary);
+        });
+        webSocketConnection_->bindSendBufferFunction([this, generation](Buffer&& frame, bool binary) {
+            if (connectionGeneration_ == generation && !closing_)
+                sendWebSocketBuffer(std::move(frame), binary);
         });
         webSocketConnection_->bindCloseFunction([this, generation]() {
             if (connectionGeneration_ == generation && !closing_)
@@ -911,7 +1023,7 @@ private:
         webSocketConnection_->bindPostFunction(
             [loop](std::function<void()> task) { return loop->tryPost(std::move(task)); });
 
-        upgradeHandler_ = &handler;
+        upgradeHandler_ = &route.handler;
         afterFlush_ = AfterFlush::Upgrade;
         if (!processing_)
             flush();
@@ -1063,8 +1175,8 @@ private:
                 readOn = false;
                 break;
             }
-            if (!hdr.masked || hdr.payloadLen > server_.config().maxWebSocketMessageBytes) {
-                closeWebSocketConnection();
+            if (!hdr.masked || hdr.payloadLen > webSocketMaxMessageBytes_) {
+                closeWebSocketConnection(hdr.masked ? 1009 : 1002);
                 readOn = false;
                 break;
             }
@@ -1131,9 +1243,8 @@ private:
                     closeWebSocketConnection();
                     return false;
                 }
-                if (payload.size() > server_.config().maxWebSocketMessageBytes -
-                                         webSocketPendingMessage_.size()) {
-                    closeWebSocketConnection();
+                if (payload.size() > webSocketMaxMessageBytes_ - webSocketPendingMessage_.size()) {
+                    closeWebSocketConnection(1009);
                     return false;
                 }
                 webSocketPendingMessage_.append(payload.data(), payload.size());
@@ -1192,6 +1303,60 @@ private:
         sendWebSocketFrameRaw(data, binary ? WsOpcode::Binary : WsOpcode::Text);
     }
 
+    // Whether a frame of `payloadSize` bytes would pass the connection's queue
+    // limits (frames and bytes, over every queue).
+    bool overQueueLimit(size_t payloadSize) const
+    {
+        const size_t queuedBytes = writeData_.size() + (writeInFlight_ ? pendingWrite_.size() : 0) +
+                                   outFrames_.pendingBytes();
+        return webSocketCorkedFrames_ + webSocketInFlightFrames_ + outFrames_.size() >=
+                   server_.config().maxWebSocketQueuedFrames ||
+               payloadSize + 10 > server_.config().maxWebSocketQueuedBytes - queuedBytes;
+    }
+
+    // send(Buffer&&): small frames are copied like any other; a big one waits
+    // in its own block and is written in place.
+    void sendWebSocketBuffer(Buffer&& frame, bool binary)
+    {
+        if (webSocketClosing_)
+            return;
+
+        const std::string_view payload = frame.view();
+        if (!binary && server_.config().validateOutgoingWebSocketText && !isValidUtf8(payload)) {
+            closeAndCleanup();
+            return;
+        }
+        if (payload.size() < kDirectFrameBytes) {
+            sendWebSocketFrameRaw(payload, binary ? WsOpcode::Binary : WsOpcode::Text);
+            return;
+        }
+        if (payload.size() > webSocketMaxMessageBytes_ || overQueueLimit(payload.size())) {
+            closeAndCleanup();
+            return;
+        }
+        internal::OutFrame out;
+        out.headerSize = static_cast<uint8_t>(
+            encodeFrameHeader(binary ? WsOpcode::Binary : WsOpcode::Text, payload.size(), true, out.header));
+        out.payload = std::move(frame);
+        if (outFrames_.empty() && !writeInFlight_ && writeData_.empty()) {
+            const size_t sent = connection_->tryWrite(reinterpret_cast<const unsigned char*>(out.header),
+                                                      out.headerSize, out.payload.data(), out.payload.size());
+            if (sent >= out.total()) {
+                resetTimeout();
+                return;
+            }
+            out.sent = sent;
+        }
+        outFrames_.reserve(server_.config().maxWebSocketQueuedFrames);
+        if (outFrames_.full()) {
+            closeAndCleanup();
+            return;
+        }
+        outFrames_.push(std::move(out));
+        if (!processing_)
+            flush();
+    }
+
     // Corks the frame; it goes out with the next flush -- at once, unless
     // frames are being handled (then together with whatever those send) or
     // a write is already in flight (then right behind it).
@@ -1200,17 +1365,11 @@ private:
         if (closing_)
             return;
 
-        if (payload.size() > server_.config().maxWebSocketMessageBytes) {
+        if (payload.size() > webSocketMaxMessageBytes_) {
             closeAndCleanup();
             return;
         }
-        const auto overLimit = [this, &payload] {
-            const size_t queuedBytes =
-                writeData_.size() + (writeInFlight_ ? pendingWrite_.size() : 0);
-            return webSocketCorkedFrames_ + webSocketInFlightFrames_ >=
-                       server_.config().maxWebSocketQueuedFrames ||
-                   payload.size() + 10 > server_.config().maxWebSocketQueuedBytes - queuedBytes;
-        };
+        const auto overLimit = [this, &payload] { return overQueueLimit(payload.size()); };
         if (overLimit()) {
             bool fits = false;
             while (!fits && server_.config().dropOldestWebSocketFrames && dropOldestFrame())
@@ -1219,6 +1378,25 @@ private:
                 closeAndCleanup();
                 return;
             }
+        }
+        if (!outFrames_.empty()) {
+            // Frames sent as pooled blocks are still waiting: this one goes
+            // behind them, as a copy in a block of its own.
+            outFrames_.reserve(server_.config().maxWebSocketQueuedFrames);
+            if (outFrames_.full()) {
+                closeAndCleanup();
+                return;
+            }
+            internal::OutFrame out;
+            out.payload = Buffer(server_.buffers_, payload.size() + 10);
+            const size_t headerSize = encodeFrameHeader(opcode, payload.size(), true,
+                                                        reinterpret_cast<char*>(out.payload.data()));
+            std::memcpy(out.payload.data() + headerSize, payload.data(), payload.size());
+            out.payload.setSize(headerSize + payload.size());
+            outFrames_.push(std::move(out));
+            if (!processing_)
+                flush();
+            return;
         }
         if (payload.size() >= kDirectFrameBytes && !writeInFlight_ && writeData_.empty()) {
             // Big enough that copying it is worth a syscall to avoid: header
@@ -1269,13 +1447,14 @@ private:
         return false;
     }
 
-    void closeWebSocketConnection()
+    void closeWebSocketConnection(uint16_t code = 1000)
     {
         if (closing_ || webSocketClosing_)
             return;
 
         webSocketClosing_ = true;
-        sendWebSocketFrameRaw(std::string_view("\x03\xe8", 2), WsOpcode::Close);
+        const char codeBytes[2] = {static_cast<char>(code >> 8), static_cast<char>(code & 0xff)};
+        sendWebSocketFrameRaw(std::string_view(codeBytes, 2), WsOpcode::Close);
         if (!closing_ && timeoutTimerId_) {
             loop_.refreshTimer(timeoutTimerId_, std::chrono::seconds(5));
             timerDue_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1386,7 +1565,9 @@ private:
         // The round's cached clock is plenty: the timer has a second of slack.
         const auto now = loop_.now();
         auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::seconds(server_.config().keepAliveTimeoutSeconds));
+            std::chrono::seconds(isWebSocket_ && webSocketIdleSeconds_ > 0
+                                     ? webSocketIdleSeconds_
+                                     : server_.config().keepAliveTimeoutSeconds));
         if (!isWebSocket_ && !isStreaming_ && (requestStarted_ || !served_)) {
             delay = std::min(delay, std::chrono::duration_cast<std::chrono::milliseconds>(
                                         requestDeadline_ - now));
@@ -1401,7 +1582,9 @@ private:
         if (timeoutTimerId_ != 0) {
             // Refreshed on every read and write, so almost always to within
             // microseconds of where it already is.
-            if (due >= timerDue_ && due - timerDue_ < kTimerSlack)
+            // The slack is a fraction of the timeout, so a short one (a route's
+            // idle timeout of a second) is still pushed back by traffic.
+            if (due >= timerDue_ && due - timerDue_ < std::min(kTimerSlack, delay / 4))
                 return;
 
             if (loop_.refreshTimer(timeoutTimerId_, delay)) {
@@ -1572,6 +1755,9 @@ private:
     bool isWebSocket_ = false;
     std::shared_ptr<WebSocketConnection> webSocketConnection_;
     size_t webSocketFrameBytesNeeded_ = 0;  // full size of the frame readBuffer_ holds the start of
+    internal::OutFrameQueue outFrames_;   // pooled frames behind writeData_ (send(Buffer&&))
+    size_t webSocketMaxMessageBytes_ = 0; // this connection's route limit
+    int webSocketIdleSeconds_ = 0;        // and idle timeout
     size_t webSocketCorkedFrames_ = 0;    // frames in writeData_
     size_t webSocketInFlightFrames_ = 0;  // frames in pendingWrite_
     size_t webSocketPartialBytes_ = 0;    // writeData_'s start: the rest of a frame already begun
@@ -1660,7 +1846,13 @@ Server& Server::onStaticFiles(std::string urlPrefix, std::string rootDir,
 
 Server& Server::onWebSocket(std::string pattern, WebSocketHandler handler)
 {
-    webSocketRoutes_.add(HttpMethod::Get, std::move(pattern), std::move(handler));
+    return onWebSocket(std::move(pattern), std::move(handler), WebSocketRouteOptions{});
+}
+
+Server& Server::onWebSocket(std::string pattern, WebSocketHandler handler, WebSocketRouteOptions options)
+{
+    webSocketRoutes_.add(HttpMethod::Get, std::move(pattern),
+                         WebSocketRoute{std::move(handler), std::move(options)});
     return *this;
 }
 

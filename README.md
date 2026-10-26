@@ -80,6 +80,16 @@ int main()
   when built with TLS and the OpenSSL archives are installed, so it drops
   onto a target device without a matching toolchain.
 
+## WebSocket routes
+
+`Server::onWebSocket(pattern, handler, WebSocketRouteOptions)` takes per-route settings: an `accept` hook that sees
+the handshake (headers, route parameters, peer address) and returns a status (`101` to upgrade, or `401`, `403`, ...
+to refuse), a `userData` handed to the handler, the `subprotocols` a client must offer (the first it offers that the
+route lists is echoed in `Sec-WebSocket-Protocol`), and a `maxMessageBytes` and `idleTimeoutSeconds` for this route's
+connections alone. `WebSocketConnection::send(Buffer&&)` sends a pooled block without copying it: frames of 8 KiB or
+more are written from the block itself (queued behind the socket if need be, in order with the copied ones) and the
+block returns to its pool once written.
+
 ## JSON
 
 `json::Json` (`include/json/json.hpp`, `src/json.cpp`) is a small,

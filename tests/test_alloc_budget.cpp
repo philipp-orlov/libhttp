@@ -326,6 +326,18 @@ void runBudget()
             [raw](std::string_view data, bool binary) { raw->send(data, binary); });
     });
 
+    // A big frame sent from its pooled block (send(Buffer&&)): no copy, no heap.
+    static http::BufferPool* wsPool = &server.bufferPool();
+    server.onWebSocket("/wsblob", [](std::shared_ptr<http::WebSocketConnection> connection) {
+        http::WebSocketConnection* raw = connection.get();
+        connection->onMessage([raw](std::string_view, bool) {
+            http::Buffer frame(*wsPool, 128 * 1024);
+            std::memset(frame.data(), 'W', 128 * 1024);
+            frame.setSize(128 * 1024);
+            raw->send(std::move(frame), true);
+        });
+    });
+
     static Feeder feeder;
     std::promise<void> streaming;
     server.onStream("/mjpeg", [&streaming](http::HttpContext& context,
@@ -413,6 +425,24 @@ void runBudget()
             fail("echo");
     });
     ::close(ws);
+
+    const int blob = connectTo(config.port, "127.0.0.100");
+    sendAll(blob,
+            "GET /wsblob HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+            "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+    std::string blobHead;
+    while (blobHead.find("\r\n\r\n") == std::string::npos) {
+        receiveExactly(blob, &byte, 1);
+        blobHead.push_back(byte);
+    }
+    std::vector<char> blobBody(10 + 128 * 1024);
+    measure("WebSocket 128 KiB frame from a pooled block", [&] {
+        sendAll(blob, std::string_view(frame, 6 + length));
+        receiveExactly(blob, blobBody.data(), 10 + 128 * 1024);  // 2 + 8 byte header
+        if (blobBody[10] != 'W' || blobBody[10 + 128 * 1024 - 1] != 'W')
+            fail("pooled frame");
+    });
+    ::close(blob);
 
     const int viewer = connectTo(config.port, "127.0.0.100");
     sendAll(viewer, "GET /mjpeg HTTP/1.1\r\nHost: x\r\n\r\n");
