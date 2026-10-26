@@ -53,7 +53,9 @@ int millisUntil(Clock::time_point when)
 {
     if (when == Clock::time_point::max())
         return -1;
-    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(when - Clock::now()).count();
+    // Rounded up: poll(2) with a truncated timeout returns just before the time is due, and a caller
+    // that loops until then would spin.
+    const auto left = std::chrono::ceil<std::chrono::milliseconds>(when - Clock::now()).count();
     if (left <= 0)
         return 0;
     return left > 0x7fffffff ? 0x7fffffff : static_cast<int>(left);
@@ -590,10 +592,13 @@ std::optional<WebSocketClient::Message> WebSocketClient::receive(Clock::time_poi
         if (pingEvery.count() > 0)
             wake = std::min(wake, lastHeard + pingEvery);
         if (!m.fill(wake)) {
-            if (Clock::now() >= deadline)
+            const Clock::time_point now = Clock::now();
+            if (now >= deadline)
                 return std::nullopt;
-            m.sendFrame(WsOpcode::Ping, nullptr, 0);
-            lastHeard = Clock::now();
+            if (pingEvery.count() > 0 && now >= lastHeard + pingEvery) {
+                m.sendFrame(WsOpcode::Ping, nullptr, 0);
+                lastHeard = now;
+            }
         }
     }
 }

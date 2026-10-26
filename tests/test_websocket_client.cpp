@@ -373,13 +373,21 @@ void warmAllocations()
 
 int main()
 {
-    urls();
-    echoSizes();
-    handshakeRefusals();
-    timeoutsAndPings();
-    closeCodes();
-    sendFromAnotherThread();
-    fragmentsPingsAndCloses();
-    warmAllocations();
+    struct Step
+    {
+        const char* name;
+        void (*run)();
+    } steps[] = {{"urls", urls}, {"echoSizes", echoSizes}, {"handshakeRefusals", handshakeRefusals},
+                 {"timeoutsAndPings", timeoutsAndPings}, {"closeCodes", closeCodes},
+                 {"sendFromAnotherThread", sendFromAnotherThread}, {"fragmentsPingsAndCloses", fragmentsPingsAndCloses},
+                 {"warmAllocations", warmAllocations}};
+    for (const Step& step : steps) {
+        try {
+            step.run();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "FAILED: %s threw: %s\n", step.name, e.what());
+            return 1;
+        }
+    }
     std::puts("websocket client: urls, echo, refusals, timeouts, pings, fragments, closes and allocations passed");
 }
