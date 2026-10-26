@@ -50,6 +50,7 @@ set(HTTP_SOURCES
     src/static_files.cpp
     src/base64.cpp
     src/websocket.cpp
+    src/websocket_client.cpp
     src/thread_pool.cpp
     src/server.cpp
     src/json.cpp
@@ -314,6 +315,10 @@ if(HTTP_BUILD_TESTS AND BUILD_TESTING)
         target_link_libraries(http_test_websocket_backpressure PRIVATE http)
         add_test(NAME http_websocket_backpressure COMMAND http_test_websocket_backpressure)
         set_tests_properties(http_websocket_backpressure PROPERTIES TIMEOUT 30)
+        add_executable(http_test_websocket_client tests/test_websocket_client.cpp)
+        target_link_libraries(http_test_websocket_client PRIVATE http)
+        add_test(NAME http_websocket_client COMMAND http_test_websocket_client)
+        set_tests_properties(http_websocket_client PROPERTIES TIMEOUT 60)
         add_executable(http_test_websocket_routes tests/test_websocket_routes.cpp)
         target_link_libraries(http_test_websocket_routes PRIVATE http)
         add_test(NAME http_websocket_routes COMMAND http_test_websocket_routes)

@@ -90,6 +90,14 @@ connections alone. `WebSocketConnection::send(Buffer&&)` sends a pooled block wi
 more are written from the block itself (queued behind the socket if need be, in order with the copied ones) and the
 block returns to its pool once written.
 
+## WebSocket client
+
+`http::WebSocketClient` (`http/websocket_client.hpp`) is a synchronous client for the same protocol: `connect("ws://host:port/path", options)`
+(extra headers, offered sub-protocols, connect timeout, message limit), `sendBinary`/`sendText`/`ping` from any thread,
+and `receive(deadline, pingEvery)`, which answers the server's pings, reassembles fragments, pings on silence and returns
+an 8-aligned view of the next message. A warm connection allocates nothing per message. `wss://` is not supported yet
+(`connect` throws `WebSocketError::Kind::Tls`); the client is POSIX-only for now.
+
 ## JSON
 
 `json::Json` (`include/json/json.hpp`, `src/json.cpp`) is a small,
