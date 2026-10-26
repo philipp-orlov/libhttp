@@ -293,7 +293,8 @@ struct WebSocketClient::Impl
             payload[0] = static_cast<char>(code >> 8);
             payload[1] = static_cast<char>(code & 0xff);
             const size_t n = std::min<size_t>(reason.size(), 123);
-            std::memcpy(payload + 2, reason.data(), n);
+            if (n)
+                std::memcpy(payload + 2, reason.data(), n);
             sendFrame(WsOpcode::Close, payload, 2 + n);
         } catch (...) {
         }
