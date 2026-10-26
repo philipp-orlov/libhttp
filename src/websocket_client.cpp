@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <csignal>
 #include <cstring>
 #include <mutex>
 #include <random>
@@ -15,6 +16,13 @@
 #include "http/buffer.hpp"
 #include "http/platform.hpp"
 #include "http/websocket.hpp"
+
+#if defined(HTTP_WITH_SSL) && !defined(HTTP_WINDOWS)
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#define HTTP_WS_CLIENT_TLS 1
+#endif
 
 #if !defined(HTTP_WINDOWS)
 #include <netdb.h>
@@ -144,10 +152,37 @@ void WebSocketClient::close(uint16_t, std::string_view) noexcept {}
 
 #else
 
+#ifdef HTTP_WS_CLIENT_TLS
+// Holds SIGPIPE back on this thread for a scope; one raised by the writes inside is swallowed.
+struct NoSigpipe
+{
+    sigset_t pipe, before;
+    bool wasPending = false;
+    NoSigpipe()
+    {
+        sigemptyset(&pipe);
+        sigaddset(&pipe, SIGPIPE);
+        pthread_sigmask(SIG_BLOCK, &pipe, &before);
+        sigset_t pending;
+        sigpending(&pending);
+        wasPending = sigismember(&pending, SIGPIPE) == 1;
+    }
+    ~NoSigpipe()
+    {
+        if (!wasPending && sigismember(&before, SIGPIPE) != 1) {
+            const timespec none{0, 0};
+            sigtimedwait(&pipe, nullptr, &none);
+        }
+        pthread_sigmask(SIG_SETMASK, &before, nullptr);
+    }
+};
+#endif
+
 struct WebSocketClient::Impl
 {
     int fd = -1;
     bool open = false;
+    bool secure = false;
     std::string subprotocol;
     size_t maxMessage = 0;
     std::mutex sendMutex;
@@ -164,9 +199,166 @@ struct WebSocketClient::Impl
 
     ~Impl() { shutdownSocket(); }
 
+#ifdef HTTP_WS_CLIENT_TLS
+    // OpenSSL objects are not safe for a reader and a writer at once, so every SSL_* call on `ssl`
+    // runs under tlsMutex and the socket is non-blocking: a call that would wait releases the
+    // mutex and polls instead.
+    SSL_CTX* sslContext = nullptr;
+    SSL* ssl = nullptr;
+    std::mutex tlsMutex;
+
+    static std::string tlsErrors(const char* what)
+    {
+        std::string text = what;
+        char line[256];
+        while (const unsigned long code = ERR_get_error()) {
+            ERR_error_string_n(code, line, sizeof(line));
+            text += ": ";
+            text += line;
+            break;
+        }
+        ERR_clear_error();
+        return text;
+    }
+
+    // Waits for the socket in the direction OpenSSL asked for.
+    void tlsWait(int sslError, Clock::time_point deadline)
+    {
+        pollfd p{fd, static_cast<short>(sslError == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN), 0};
+        const int ms = deadline == Clock::time_point::max() ? 1000 : millisUntil(deadline);
+        const int ready = ::poll(&p, 1, ms);
+        if (ready < 0 && errno != EINTR)
+            throw WebSocketError(Kind::Io, std::string("poll failed: ") + std::strerror(errno));
+    }
+
+    void tlsHandshake(const WebSocketUrl& url, const WebSocketClientOptions& options, Clock::time_point deadline)
+    {
+        sslContext = SSL_CTX_new(TLS_client_method());
+        if (!sslContext)
+            throw WebSocketError(Kind::Tls, tlsErrors("SSL_CTX_new"));
+        SSL_CTX_set_min_proto_version(sslContext, TLS1_2_VERSION);
+        SSL_CTX_set_mode(sslContext, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        SSL_CTX_set_options(sslContext, SSL_OP_IGNORE_UNEXPECTED_EOF);
+        if (options.insecureSkipVerify) {
+            SSL_CTX_set_verify(sslContext, SSL_VERIFY_NONE, nullptr);
+        } else {
+            SSL_CTX_set_verify(sslContext, SSL_VERIFY_PEER, nullptr);
+            const int loaded = options.caFile.empty() ? SSL_CTX_set_default_verify_paths(sslContext)
+                                                      : SSL_CTX_load_verify_locations(sslContext, options.caFile.c_str(), nullptr);
+            if (loaded != 1)
+                throw WebSocketError(Kind::Tls, tlsErrors("cannot load the trusted certificates"));
+        }
+        ssl = SSL_new(sslContext);
+        if (!ssl || SSL_set_fd(ssl, fd) != 1)
+            throw WebSocketError(Kind::Tls, tlsErrors("SSL_new"));
+        // Host name checks (an IP literal is matched against the certificate's IP entries).
+        in6_addr probe;
+        const bool literal = ::inet_pton(AF_INET, url.host.c_str(), &probe) == 1 || ::inet_pton(AF_INET6, url.host.c_str(), &probe) == 1;
+        if (!options.insecureSkipVerify) {
+            const int set = literal ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), url.host.c_str())
+                                    : SSL_set1_host(ssl, url.host.c_str());
+            if (set != 1)
+                throw WebSocketError(Kind::Tls, tlsErrors("cannot set the expected host name"));
+        }
+        if (!literal)
+            SSL_set_tlsext_host_name(ssl, url.host.c_str());
+        SSL_set_connect_state(ssl);
+        for (;;) {
+            int result, error;
+            {
+                std::lock_guard<std::mutex> lock(tlsMutex);
+                ERR_clear_error();
+                result = SSL_connect(ssl);
+                error = result == 1 ? SSL_ERROR_NONE : SSL_get_error(ssl, result);
+            }
+            if (result == 1)
+                return;
+            if (error != SSL_ERROR_WANT_READ && error != SSL_ERROR_WANT_WRITE) {
+                std::string why = tlsErrors("TLS handshake failed");
+                if (const long verify = SSL_get_verify_result(ssl); verify != X509_V_OK)
+                    why += std::string(" (certificate: ") + X509_verify_cert_error_string(verify) + ")";
+                throw WebSocketError(Kind::Tls, why);
+            }
+            if (Clock::now() >= deadline)
+                throw WebSocketError(Kind::Connect, "the TLS handshake timed out");
+            tlsWait(error, deadline);
+        }
+    }
+
+    void tlsSendAll(const char* data, size_t size)
+    {
+        while (size) {
+            int sent, error = SSL_ERROR_NONE;
+            {
+                std::lock_guard<std::mutex> lock(tlsMutex);
+                if (!ssl)
+                    throw WebSocketError(Kind::Io, "send failed: the connection is closed");
+                ERR_clear_error();
+                NoSigpipe guard;  // SSL_write uses write(2), which raises SIGPIPE on a dead peer
+                sent = SSL_write(ssl, data, static_cast<int>(std::min<size_t>(size, 1u << 30)));
+                if (sent <= 0)
+                    error = SSL_get_error(ssl, sent);
+            }
+            if (sent > 0) {
+                data += sent;
+                size -= static_cast<size_t>(sent);
+                continue;
+            }
+            if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+                tlsWait(error, Clock::time_point::max());
+                continue;
+            }
+            shutdownSocket();
+            throw WebSocketError(Kind::Io, tlsErrors("TLS send failed"));
+        }
+    }
+
+    // One SSL_read into `chunk`; 0 when nothing is ready, -1 at the end of the stream.
+    ssize_t tlsRecv(char* chunk, size_t size)
+    {
+        std::lock_guard<std::mutex> lock(tlsMutex);
+        if (!ssl)
+            return -1;
+        ERR_clear_error();
+        const int got = SSL_read(ssl, chunk, static_cast<int>(size));
+        if (got > 0)
+            return got;
+        const int error = SSL_get_error(ssl, got);
+        if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
+            return 0;
+        if (error == SSL_ERROR_ZERO_RETURN || (error == SSL_ERROR_SYSCALL && errno == 0))
+            return -1;
+        throw WebSocketError(Kind::Io, tlsErrors("TLS receive failed"));
+    }
+
+    bool tlsPending()
+    {
+        std::lock_guard<std::mutex> lock(tlsMutex);
+        return ssl && SSL_pending(ssl) > 0;
+    }
+#endif
+
     void shutdownSocket() noexcept
     {
         open = false;
+#ifdef HTTP_WS_CLIENT_TLS
+        {
+            // One critical section: another thread may be inside SSL_read or SSL_write.
+            std::lock_guard<std::mutex> lock(tlsMutex);
+            if (ssl) {
+                if (fd >= 0) {
+                    NoSigpipe guard;
+                    SSL_shutdown(ssl);
+                }  // close_notify, best effort; the socket is non-blocking
+                SSL_free(ssl);
+                ssl = nullptr;
+            }
+            if (sslContext) {
+                SSL_CTX_free(sslContext);
+                sslContext = nullptr;
+            }
+        }
+#endif
         if (fd >= 0) {
             ::close(fd);
             fd = -1;
@@ -185,6 +377,12 @@ struct WebSocketClient::Impl
 
     void sendAll(const char* data, size_t size)
     {
+#ifdef HTTP_WS_CLIENT_TLS
+        if (secure) {
+            tlsSendAll(data, size);
+            return;
+        }
+#endif
         while (size) {
             const ssize_t sent = ::send(fd, data, size, MSG_NOSIGNAL);
             if (sent < 0) {
@@ -226,6 +424,10 @@ struct WebSocketClient::Impl
     // Reads what the socket has (blocking up to `deadline`); false on timeout.
     bool fill(Clock::time_point deadline)
     {
+#ifdef HTTP_WS_CLIENT_TLS
+        if (secure && tlsPending())
+            return readSome();
+#endif
         pollfd p{fd, POLLIN, 0};
         for (;;) {
             const int ready = ::poll(&p, 1, millisUntil(deadline));
@@ -252,6 +454,24 @@ struct WebSocketClient::Impl
             inPos = 0;
         }
         char chunk[16384];
+#ifdef HTTP_WS_CLIENT_TLS
+        if (secure) {
+            ssize_t got;
+            try {
+                got = tlsRecv(chunk, sizeof(chunk));
+            } catch (...) {
+                shutdownSocket();
+                throw;
+            }
+            if (got < 0) {
+                shutdownSocket();
+                throw WebSocketError(Kind::Closed, "the connection was closed", 0, closeCode ? closeCode : 1006, closeReason);
+            }
+            if (got > 0)
+                in.append(chunk, static_cast<size_t>(got));
+            return true;
+        }
+#endif
         const ssize_t got = ::recv(fd, chunk, sizeof(chunk), 0);
         if (got < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
@@ -353,8 +573,11 @@ void WebSocketClient::connect(std::string_view urlText, const WebSocketClientOpt
     if (m.open)
         throw WebSocketError(Kind::Usage, "already connected");
     const WebSocketUrl url = parseWebSocketUrl(urlText);
+#ifndef HTTP_WS_CLIENT_TLS
     if (url.secure)
-        throw WebSocketError(Kind::Tls, "wss:// is not supported by this build of libhttp");
+        throw WebSocketError(Kind::Tls, "wss:// needs a libhttp built with HTTP_WITH_SSL");
+#endif
+    m.secure = url.secure;
     m.pool = options.pool ? options.pool : &BufferPool::shared();
     m.maxMessage = options.maxMessageBytes;
     m.subprotocol.clear();
@@ -408,7 +631,8 @@ void WebSocketClient::connect(std::string_view urlText, const WebSocketClientOpt
             lastError = std::strerror(errno);
         }
         if (rc == 0) {
-            ::fcntl(s, F_SETFL, flags);
+            if (!url.secure)
+                ::fcntl(s, F_SETFL, flags);  // TLS keeps the socket non-blocking
             fd = s;
         } else {
             ::close(s);
@@ -430,7 +654,7 @@ void WebSocketClient::connect(std::string_view urlText, const WebSocketClientOpt
     }
     const std::string key = base64Encode(nonce, sizeof(nonce));
     std::string request = "GET " + url.target + " HTTP/1.1\r\nHost: " + url.host;
-    if (url.port != 80)
+    if (url.port != (url.secure ? 443 : 80))
         request += ":" + port;
     request += "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + "\r\n";
     if (!options.subprotocols.empty()) {
@@ -443,6 +667,10 @@ void WebSocketClient::connect(std::string_view urlText, const WebSocketClientOpt
         request += name + ": " + value + "\r\n";
     request += "\r\n";
     try {
+#ifdef HTTP_WS_CLIENT_TLS
+        if (url.secure)
+            m.tlsHandshake(url, options, deadline);
+#endif
         m.open = true;
         m.sendAll(request.data(), request.size());
         size_t end;
@@ -611,7 +839,11 @@ bool WebSocketClient::peerClosed()
         return true;
     try {
         pollfd p{m.fd, POLLIN, 0};
-        while (::poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR))) {
+        while (
+#ifdef HTTP_WS_CLIENT_TLS
+            (m.secure && m.tlsPending()) ||
+#endif
+            (::poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR)))) {
             m.readSome();  // throws Closed on end of stream
             p.revents = 0;
         }

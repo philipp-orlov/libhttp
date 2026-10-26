@@ -182,9 +182,13 @@ void handshakeRefusals()
         WebSocketClient w;
         w.connect("wss://127.0.0.1:1/");
     } catch (const WebSocketError& e) {
+#ifdef HTTP_WITH_SSL
+        tls = e.kind() == WebSocketError::Kind::Connect;  // TLS is supported; nothing listens on port 1
+#else
         tls = e.kind() == WebSocketError::Kind::Tls;
+#endif
     }
-    expect(tls, "wss reports Tls");
+    expect(tls, "wss is refused: Tls without OpenSSL, Connect with it");
 }
 
 void timeoutsAndPings()

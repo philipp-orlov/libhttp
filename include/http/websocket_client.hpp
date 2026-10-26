@@ -64,8 +64,9 @@ struct WebSocketClientOptions
     std::vector<std::string> subprotocols;                      // offered, in order
     std::chrono::milliseconds connectTimeout{10000};
     size_t maxMessageBytes = 16 * 1024 * 1024;
-    // wss:// is not supported in this build of libhttp (the server side's OpenSSL
-    // wrapper has no client mode yet): connect() throws Kind::Tls for it.
+    // wss:// needs a libhttp built with HTTP_WITH_SSL (connect() throws Kind::Tls otherwise).
+    // The server's certificate chain and host name (or IP) are verified against caFile, or the
+    // system's trusted roots when it is empty; insecureSkipVerify turns that off (tests only).
     std::string caFile;
     bool insecureSkipVerify = false;
     // Where the message buffer comes from; nullptr = BufferPool::shared().
