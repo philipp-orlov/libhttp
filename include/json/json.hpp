@@ -30,7 +30,7 @@ template <typename Value>
 struct Field
 {
     template <typename T>
-    Field(std::string_view name, T&& value) : key(name), value(std::forward<T>(value))
+    Field(std::string_view name, T&& init) : key(name), value(std::forward<T>(init))
     {}
 
     std::string_view key;
