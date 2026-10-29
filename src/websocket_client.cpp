@@ -4,6 +4,7 @@
 #include "http/websocket_client.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
@@ -181,7 +182,9 @@ struct NoSigpipe
 struct WebSocketClient::Impl
 {
     int fd = -1;
-    bool open = false;
+    // open: the connection is usable. Cleared by abortSocket() from any thread; the descriptor and the TLS state
+    // are only released by releaseSocket() (destructor, connect), when no other thread is inside the client.
+    std::atomic<bool> open{false};
     bool secure = false;
     std::string subprotocol;
     size_t maxMessage = 0;
@@ -197,7 +200,7 @@ struct WebSocketClient::Impl
     uint16_t closeCode = 0;
     std::string closeReason;
 
-    ~Impl() { shutdownSocket(); }
+    ~Impl() { releaseSocket(); }
 
 #ifdef HTTP_WS_CLIENT_TLS
     // OpenSSL objects are not safe for a reader and a writer at once, so every SSL_* call on `ssl`
@@ -308,7 +311,7 @@ struct WebSocketClient::Impl
                 tlsWait(error, Clock::time_point::max());
                 continue;
             }
-            shutdownSocket();
+            abortSocket();
             throw WebSocketError(Kind::Io, tlsErrors("TLS send failed"));
         }
     }
@@ -338,7 +341,18 @@ struct WebSocketClient::Impl
     }
 #endif
 
-    void shutdownSocket() noexcept
+    // Ends the connection without freeing anything, so it is safe while another thread is in receive() (which
+    // wakes with an error) or in a send (which fails): shutdown(2) on the descriptor, which stays open until
+    // releaseSocket(). Thread-safe.
+    void abortSocket() noexcept
+    {
+        open = false;
+        const int descriptor = fd;
+        if (descriptor >= 0)
+            ::shutdown(descriptor, SHUT_RDWR);
+    }
+
+    void releaseSocket() noexcept
     {
         open = false;
 #ifdef HTTP_WS_CLIENT_TLS
@@ -388,7 +402,7 @@ struct WebSocketClient::Impl
             if (sent < 0) {
                 if (errno == EINTR)
                     continue;
-                shutdownSocket();
+                abortSocket();
                 throw WebSocketError(Kind::Io, std::string("send failed: ") + std::strerror(errno));
             }
             data += sent;
@@ -434,7 +448,7 @@ struct WebSocketClient::Impl
             if (ready < 0) {
                 if (errno == EINTR)
                     continue;
-                shutdownSocket();
+                abortSocket();
                 throw WebSocketError(Kind::Io, std::string("poll failed: ") + std::strerror(errno));
             }
             if (ready == 0)
@@ -460,11 +474,11 @@ struct WebSocketClient::Impl
             try {
                 got = tlsRecv(chunk, sizeof(chunk));
             } catch (...) {
-                shutdownSocket();
+                abortSocket();
                 throw;
             }
             if (got < 0) {
-                shutdownSocket();
+                abortSocket();
                 throw WebSocketError(Kind::Closed, "the connection was closed", 0, closeCode ? closeCode : 1006, closeReason);
             }
             if (got > 0)
@@ -476,11 +490,11 @@ struct WebSocketClient::Impl
         if (got < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                 return true;
-            shutdownSocket();
+            abortSocket();
             throw WebSocketError(Kind::Io, std::string("recv failed: ") + std::strerror(errno));
         }
         if (got == 0) {
-            shutdownSocket();
+            abortSocket();
             throw WebSocketError(Kind::Closed, "the connection was closed", 0, closeCode ? closeCode : 1006, closeReason);
         }
         in.append(chunk, static_cast<size_t>(got));
@@ -491,7 +505,7 @@ struct WebSocketClient::Impl
     {
         if (size > maxMessage - messageSize) {
             sendCloseFrame(1009, "message too big");
-            shutdownSocket();
+            abortSocket();
             throw WebSocketError(Kind::TooBig, "a message exceeds the configured maximum");
         }
         const size_t need = messageSize + size;
@@ -572,6 +586,7 @@ void WebSocketClient::connect(std::string_view urlText, const WebSocketClientOpt
     Impl& m = *impl_;
     if (m.open)
         throw WebSocketError(Kind::Usage, "already connected");
+    m.releaseSocket();  // a previous connection's descriptor
     const WebSocketUrl url = parseWebSocketUrl(urlText);
 #ifndef HTTP_WS_CLIENT_TLS
     if (url.secure)
@@ -715,7 +730,7 @@ void WebSocketClient::connect(std::string_view urlText, const WebSocketClientOpt
         }
         m.inPos = end + 4;  // frames sent on the heels of the 101 are already in `in`
     } catch (...) {
-        m.shutdownSocket();
+        m.releaseSocket();
         throw;
     }
 }
@@ -750,18 +765,18 @@ std::optional<WebSocketClient::Message> WebSocketClient::receive(Clock::time_poi
             have = tryParseFrameHeader(std::string_view(m.in).substr(m.inPos), hdr);
         } catch (const std::exception&) {
             m.sendCloseFrame(1002, "bad frame");
-            m.shutdownSocket();
+            m.abortSocket();
             throw WebSocketError(Kind::Protocol, "the server sent a malformed frame");
         }
         if (have) {
             if (hdr.masked) {
                 m.sendCloseFrame(1002, "masked frame from server");
-                m.shutdownSocket();
+                m.abortSocket();
                 throw WebSocketError(Kind::Protocol, "the server sent a masked frame");
             }
             if (hdr.payloadLen > m.maxMessage) {
                 m.sendCloseFrame(1009, "message too big");
-                m.shutdownSocket();
+                m.abortSocket();
                 throw WebSocketError(Kind::TooBig, "a frame exceeds the configured maximum");
             }
             const size_t total = hdr.headerSize + static_cast<size_t>(hdr.payloadLen);
@@ -775,7 +790,7 @@ std::optional<WebSocketClient::Message> WebSocketClient::receive(Clock::time_poi
                     case WsOpcode::Binary:
                         if (m.assembling) {
                             m.sendCloseFrame(1002, "unexpected data frame");
-                            m.shutdownSocket();
+                            m.abortSocket();
                             throw WebSocketError(Kind::Protocol, "a data frame arrived inside a fragmented message");
                         }
                         m.messageSize = 0;
@@ -786,7 +801,7 @@ std::optional<WebSocketClient::Message> WebSocketClient::receive(Clock::time_poi
                     case WsOpcode::Continuation:
                         if (!m.assembling) {
                             m.sendCloseFrame(1002, "unexpected continuation");
-                            m.shutdownSocket();
+                            m.abortSocket();
                             throw WebSocketError(Kind::Protocol, "a continuation frame without a message");
                         }
                         m.appendMessage(payload, size);
@@ -798,12 +813,12 @@ std::optional<WebSocketClient::Message> WebSocketClient::receive(Clock::time_poi
                         m.closeCode = size >= 2 ? static_cast<uint16_t>((static_cast<uint8_t>(payload[0]) << 8) | static_cast<uint8_t>(payload[1])) : 1005;
                         m.closeReason = size > 2 ? std::string(payload + 2, size - 2) : std::string();
                         m.sendCloseFrame(m.closeCode == 1005 ? 1000 : m.closeCode, "");
-                        m.shutdownSocket();
+                        m.abortSocket();
                         throw WebSocketError(Kind::Closed, "the server closed the connection", 0, m.closeCode, m.closeReason);
                     }
                     default:
                         m.sendCloseFrame(1002, "unknown opcode");
-                        m.shutdownSocket();
+                        m.abortSocket();
                         throw WebSocketError(Kind::Protocol, "the server sent an unknown opcode");
                 }
                 if (m.assembling)
@@ -858,7 +873,7 @@ void WebSocketClient::close(uint16_t code, std::string_view reason) noexcept
     Impl& m = *impl_;
     if (m.open)
         m.sendCloseFrame(code, reason);
-    m.shutdownSocket();
+    m.abortSocket();  // safe against a thread blocked in receive(): it wakes with Closed
 }
 
 #endif

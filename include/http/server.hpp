@@ -193,7 +193,9 @@ public:
 
     // The caller coordinates shutdown; reactors run on dedicated threads.
     // shouldStop is polled on the caller, suitable for a sig_atomic_t flag.
-    void run(std::function<bool()> shouldStop = {});
+    // onListening, when given, runs once the listening sockets are bound, so
+    // a client that waits for it cannot be refused.
+    void run(std::function<bool()> shouldStop = {}, std::function<void()> onListening = {});
     void stop();
 
     const ServerConfig& config() const { return config_; }

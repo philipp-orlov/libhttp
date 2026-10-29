@@ -1988,7 +1988,7 @@ void Server::runLoop(size_t index)
     loops_[index]->run();
 }
 
-void Server::run(std::function<bool()> shouldStop)
+void Server::run(std::function<bool()> shouldStop, std::function<void()> onListening)
 {
     if (!loops_.empty())
         throw std::logic_error("Server::run may only be called once");
@@ -2025,6 +2025,8 @@ void Server::run(std::function<bool()> shouldStop)
     }
 
     loopsReady_.store(true, std::memory_order_release);
+    if (onListening)
+        onListening();
     const size_t workers = config_.workerThreads ? config_.workerThreads : 2;
     if (config_.reactorTaskCapacity < config_.workerQueueCapacity + workers)
         HTTP_LOG_WARN(
