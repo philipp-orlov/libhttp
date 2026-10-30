@@ -166,7 +166,8 @@ void HttpParser::reset()
     chunkRemaining_ = 0;
     headerBytes_ = headerCount_ = trailerBytes_ = trailerCount_ = 0;
     hasContentLength_ = hasTransferEncoding_ = hasHost_ = false;
-    connectionIndex_ = upgradeIndex_ = expectIndex_ = kNoHeader;
+    upgradeIndex_ = expectIndex_ = kNoHeader;
+    connClose_ = connKeepAlive_ = connUpgrade_ = false;
     base_ = nullptr;
     targetSpan_ = pathSpan_ = querySpan_ = Span{};
     hasQuery_ = pathEscaped_ = false;
@@ -320,8 +321,12 @@ bool HttpParser::parseHeaderLine(std::string_view line, HttpRequest&, std::strin
 
             break;
         case 10:
-            if (connectionIndex_ == kNoHeader && equalsIgnoreCase(name, "Connection"))
-                connectionIndex_ = index;
+            // A list-valued field that may repeat: every line contributes its tokens.
+            if (equalsIgnoreCase(name, "Connection")) {
+                connClose_ |= hasToken(value, "close");
+                connKeepAlive_ |= hasToken(value, "keep-alive");
+                connUpgrade_ |= hasToken(value, "upgrade");
+            }
 
             break;
         case 14:
@@ -405,19 +410,18 @@ bool HttpParser::finalizeHeaders(HttpRequest& out, std::string& error)
     expectContinue_ = out.versionMinor == 1 && (chunked_ || contentLength_ > 0) &&
                       expectIndex_ != kNoHeader && hasToken(headerAt(expectIndex_), "100-continue");
 
-    const std::string_view connection = headerAt(connectionIndex_);
-    if (!connection.empty()) {
-        if (hasToken(connection, "close"))
-            out.keepAlive = false;
-        else if (hasToken(connection, "keep-alive"))
-            out.keepAlive = true;
+    // close wins over keep-alive wherever either appears.
+    if (connClose_)
+        out.keepAlive = false;
+    else if (connKeepAlive_)
+        out.keepAlive = true;
 
-        if (upgradeIndex_ != kNoHeader && hasToken(connection, "upgrade") &&
-            equalsIgnoreCase(headerAt(upgradeIndex_), "websocket")) {
-            out.isUpgrade = true;
-            out.upgradeTo = "websocket";
-            out.keepAlive = true;
-        }
+    // Upgrade and Expect keep their first line (a repeated Upgrade is not meaningful here).
+    if (upgradeIndex_ != kNoHeader && connUpgrade_ &&
+        equalsIgnoreCase(headerAt(upgradeIndex_), "websocket")) {
+        out.isUpgrade = true;
+        out.upgradeTo = "websocket";
+        out.keepAlive = true;
     }
     return true;
 }

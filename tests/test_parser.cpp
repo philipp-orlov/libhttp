@@ -159,5 +159,37 @@ int main()
                     static_cast<long long>(tookMs));
     }
 
+    {
+        // Connection is list-valued: tokens from every line count, in any order.
+        struct Case { const char* lines; bool keepAlive; };
+        const Case cases[] = {
+            {"Connection: keep-alive\r\nConnection: close\r\n", false},
+            {"Connection: close\r\nConnection: keep-alive\r\n", false},
+            {"Connection: keep-alive, close\r\n", false},
+            {"CONNECTION:  Keep-Alive \r\ncOnNeCtIoN:\tCLOSE\r\n", false},
+            {"Connection: TE\r\nConnection: keep-alive\r\n", true},
+            {"Connection: closed\r\n", true},
+        };
+        for (const Case& c : cases) {
+            http::HttpParser parser;
+            http::HttpRequest request;
+            std::string error;
+            size_t consumed = 0;
+            const std::string wire = std::string("GET / HTTP/1.1\r\nHost: x\r\n") + c.lines + "\r\n";
+            if (parser.parse(wire, consumed, request, error) != http::ParseStatus::Complete ||
+                request.keepAlive != c.keepAlive)
+                return 20;
+        }
+        http::HttpParser parser;
+        http::HttpRequest request;
+        std::string error;
+        size_t consumed = 0;
+        const std::string upgrade = "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n"
+                                    "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        if (parser.parse(upgrade, consumed, request, error) != http::ParseStatus::Complete ||
+            !request.isUpgrade || !request.keepAlive)
+            return 21;
+    }
+
     std::puts("parser: malformed framing, fragmentation boundaries and direct body receive passed");
 }

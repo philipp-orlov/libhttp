@@ -137,9 +137,12 @@ private:
     bool hasHost_ = false;
     // Positions in HttpRequest::headers of the headers finalizeHeaders()
     // consults, noted as they are parsed so it need not scan for them.
-    size_t connectionIndex_ = kNoHeader;
     size_t upgradeIndex_ = kNoHeader;
     size_t expectIndex_ = kNoHeader;
+    // Connection tokens seen across every Connection line of the request.
+    bool connClose_ = false;
+    bool connKeepAlive_ = false;
+    bool connUpgrade_ = false;
     bool incrementalConsumption_ = false;
 
     // The current parse() call's buffer start, which spans are relative to.

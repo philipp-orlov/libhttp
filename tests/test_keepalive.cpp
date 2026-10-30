@@ -56,6 +56,22 @@ int main()
     expect(waited < std::chrono::seconds(3), 3, "stalled request closed near the request deadline");
     ::close(slow);
 
+    // A close in a later Connection line ends the connection: the pipelined
+    // request behind it is never dispatched.
+    const int closing = connectTo(config.port, 5);
+    sendAll(closing, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n"
+                     "Connection: close\r\n\r\nGET /ping HTTP/1.1\r\nHost: x\r\n\r\n");
+    std::string all;
+    char chunk[512];
+    for (ssize_t got; (got = ::recv(closing, chunk, sizeof chunk, 0)) > 0;)
+        all.append(chunk, static_cast<size_t>(got));
+    size_t responses = 0;
+    for (size_t at = all.find("HTTP/1.1 200"); at != std::string::npos;
+         at = all.find("HTTP/1.1 200", at + 1))
+        ++responses;
+    expect(responses == 1, 4, "exactly one response before a Connection: close in a later line");
+    ::close(closing);
+
     server.stop();
     serving.get();
     std::puts("keep-alive: per-request deadline passed");
