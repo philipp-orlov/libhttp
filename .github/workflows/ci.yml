@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc release
+            cxx: g++
+            build_type: Release
+            sanitize: ""
+          - name: gcc debug asan+ubsan
+            cxx: g++
+            build_type: Debug
+            sanitize: "address,undefined"
+          - name: clang debug tsan
+            cxx: clang++
+            build_type: Debug
+            sanitize: "thread"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libssl-dev clang
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DHTTP_WITH_SSL=ON
+          -DBUILD_TESTING=ON
+          -DHTTP_BUILD_EXAMPLES=OFF
+          -DHTTP_BUILD_FUZZ=ON
+          "-DHTTP_SANITIZE=${{ matrix.sanitize }}"
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+  # libFuzzer needs Clang; the targets are built with it and run for a fixed time.
+  fuzz:
+    name: libFuzzer ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [http_parser, ws_frames, json]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libssl-dev clang
+      - name: Build
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++
+          -DHTTP_BUILD_FUZZ=ON -DHTTP_BUILD_TESTS=OFF -DHTTP_BUILD_EXAMPLES=OFF
+          && cmake --build build --target fuzz_${{ matrix.target }}
+      - name: Fuzz for two minutes
+        run: |
+          mkdir -p corpus
+          ./build/fuzz_${{ matrix.target }} -max_total_time=120 -timeout=10 corpus
