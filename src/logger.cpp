@@ -34,7 +34,11 @@ Logger::Logger()
 Logger::~Logger()
 {
     flush();
-    running_.store(false, std::memory_order_relaxed);
+    {
+        // Under the mutex so the worker cannot test its wait predicate between the store and the notification.
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        running_.store(false, std::memory_order_relaxed);
+    }
     queue_cv_.notify_all();
     if (worker_.joinable())
         worker_.join();
@@ -171,22 +175,51 @@ void Logger::log(LogLevel level, std::string_view message)
         return;
     }
     pending_.push_back(std::move(entry));
+    ++enqueued_;
     queue_cv_.notify_one();
+}
+
+// Writes `count` records to the console and the file sink. Worker thread only.
+void Logger::emit(const Record* records, size_t count)
+{
+    if (!count)
+        return;
+    if (console_enabled_.load(std::memory_order_relaxed)) {
+        for (size_t index = 0; index < count; ++index)
+            std::fwrite(records[index].data(), 1, records[index].size(), stdout);
+
+        std::fflush(stdout);
+    }
+    std::lock_guard<std::mutex> lock(file_mutex_);
+    if (file_) {
+        for (size_t index = 0; index < count; ++index)
+            std::fwrite(records[index].data(), 1, records[index].size(), file_);
+
+        std::fflush(file_);
+    }
 }
 
 void Logger::workerLoop()
 {
-    while (running_.load(std::memory_order_relaxed)) {
+    for (;;) {
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             queue_cv_.wait_for(lock, std::chrono::milliseconds(200), [this] {
-                return !pending_.empty() || flush_requested_.load(std::memory_order_relaxed) ||
-                       !running_.load(std::memory_order_relaxed);
+                return !pending_.empty() || !running_.load(std::memory_order_relaxed);
             });
+            // Stopping: leave only once everything logged before the stop has been written.
+            if (pending_.empty() && !running_.load(std::memory_order_relaxed))
+                return;
+
             std::swap(pending_, draining_);
         }
 
-        // Records lost to a full queue leave a trace of their own, at most once a second.
+        const size_t written = draining_.size();
+        emit(draining_.data(), written);
+        draining_.clear();
+
+        // Records lost to a full queue leave a trace of their own, at most once a second. It is written on its own,
+        // so it never grows `draining_` past the capacity reserved for it.
         const size_t dropped = dropped_.load(std::memory_order_relaxed);
         const auto now = std::chrono::steady_clock::now();
         if (dropped != reported_dropped_ && now - last_drop_report_ >= std::chrono::seconds(1)) {
@@ -194,42 +227,25 @@ void Logger::workerLoop()
                                      " log records dropped (queue full)";
             reported_dropped_ = dropped;
             last_drop_report_ = now;
-            draining_.push_back(compose(LogLevel::Warn, text));
+            const Record report = compose(LogLevel::Warn, text);
+            emit(&report, 1);
         }
 
-        if (!draining_.empty()) {
-            if (console_enabled_.load(std::memory_order_relaxed)) {
-                for (auto& line : draining_)
-                    std::fwrite(line.data(), 1, line.size(), stdout);
-
-                std::fflush(stdout);
-            }
-            {
-                std::lock_guard<std::mutex> lock(file_mutex_);
-                if (file_) {
-                    for (auto& line : draining_)
-                        std::fwrite(line.data(), 1, line.size(), file_);
-
-                    std::fflush(file_);
-                }
-            }
-            draining_.clear();
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            written_ += written;
         }
-
-        if (flush_requested_.load(std::memory_order_relaxed)) {
-            flush_requested_.store(false, std::memory_order_relaxed);
-            flush_cv_.notify_all();
-        }
+        flush_cv_.notify_all();
     }
 }
 
 void Logger::flush()
 {
     std::unique_lock<std::mutex> lock(queue_mutex_);
-    flush_requested_.store(true, std::memory_order_relaxed);
-    queue_cv_.notify_all();
-    flush_cv_.wait_for(lock, std::chrono::seconds(2),
-                       [this] { return !flush_requested_.load(std::memory_order_relaxed); });
+    // Everything logged before this call, and nothing later, is what has to reach the sinks.
+    const uint64_t target = enqueued_;
+    queue_cv_.notify_one();
+    flush_cv_.wait_for(lock, std::chrono::seconds(2), [this, target] { return written_ >= target; });
 }
 
 void logFormatted(LogLevel level, const char* fmt, ...)

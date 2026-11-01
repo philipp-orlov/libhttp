@@ -83,6 +83,37 @@ int main()
     expect(slurp(path).find("after rotation") != std::string::npos, 8, "new file after reopen");
     expect(slurp(path + ".1").find("after rotation") == std::string::npos, 9, "old file left alone");
 
+    // flush() returns only after every record logged before the call is in the file, even when the writer is in
+    // the middle of a batch. Rounds are small enough that nothing is dropped.
+    std::atomic<bool> background{true};
+    std::thread noise([&] {  // keeps the writer busy, so flush() usually arrives while it is mid-batch
+        while (background.load(std::memory_order_relaxed)) {
+            HTTP_LOG_INFO("noise");
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+    });
+    for (int round = 0; round < 300; ++round) {
+        constexpr int kLines = 20;
+        std::thread other([round] {
+            for (int line = 0; line < kLines; ++line)
+                HTTP_LOG_INFO("flushcheck %d b%d", round, line);
+        });
+        for (int line = 0; line < kLines; ++line)
+            HTTP_LOG_INFO("flushcheck %d a%d", round, line);
+        other.join();
+        logger.flush();
+        const std::string content = slurp(path);
+        for (int line = 0; line < kLines; ++line) {
+            const std::string a = "flushcheck " + std::to_string(round) + " a" + std::to_string(line) + "\n";
+            const std::string b = "flushcheck " + std::to_string(round) + " b" + std::to_string(line) + "\n";
+            expect(content.find(a) != std::string::npos && content.find(b) != std::string::npos, 13,
+                   "a record logged before flush() is in the file");
+        }
+    }
+
+    background = false;
+    noise.join();
+
     // A flood beyond the queue leaves a "dropped" record behind. Many producers
     // are needed to outrun the writer thread; if this machine still keeps up,
     // there is nothing to report and that part is skipped.

@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -70,6 +71,7 @@ private:
     static const char* levelName(LogLevel level);
     struct Record;
     Record compose(LogLevel level, std::string_view message);
+    void emit(const Record* records, size_t count);
     bool openFile();
 
     std::atomic<LogLevel> level_{LogLevel::Info};
@@ -96,7 +98,8 @@ private:
     std::atomic<size_t> dropped_{0};
     std::atomic<size_t> truncated_{0};
     std::atomic<bool> running_{true};
-    std::atomic<bool> flush_requested_{false};
+    uint64_t enqueued_ = 0;  // records accepted into pending_ (queue_mutex_)
+    uint64_t written_ = 0;   // records handed to the sinks (queue_mutex_)
     std::condition_variable flush_cv_;
     std::thread worker_;
 };
