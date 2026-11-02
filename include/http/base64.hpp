@@ -3,21 +3,17 @@
 
 #pragma once
 
-#include <cstddef>
+// base64 lives in develop-core's libbase; these keep the old names.
 #include <cstdint>
 #include <string>
 #include <string_view>
 
+#include "base/encoding.hpp"
+
 namespace http {
 
-// RFC 4648 base64 (standard alphabet, '=' padding), self-contained since no
-// 3rd-party dependency is permitted. Used by the WebSocket handshake's
-// Sec-WebSocket-Accept computation; also available generally for encoding
-// binary data into headers/cookies and decoding it back.
-std::string base64Encode(const uint8_t* data, size_t len);
-
-// Decodes `input`; non-alphabet characters (padding, whitespace, etc.) are
-// skipped rather than rejected.
-std::string base64Decode(std::string_view input);
+inline std::string base64Encode(const uint8_t* data, size_t len) { return base::base64Encode(data, len); }
+// Non-alphabet characters (padding, whitespace) are skipped rather than rejected.
+inline std::string base64Decode(std::string_view input) { return base::base64Decode(input); }
 
 }  // namespace http
