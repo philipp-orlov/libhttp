@@ -131,7 +131,7 @@ int main()
     if (logger.droppedRecords() > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2500));
         logger.flush();
-        expect(slurp(path).find("log records dropped (queue full)") != std::string::npos, 11,
+        expect(slurp(path).find("log lines dropped") != std::string::npos, 11,
                "dropped records reported");
     } else {
         std::puts("logger: writer kept up with the flood, dropped-record report not exercised");

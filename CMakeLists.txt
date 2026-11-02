@@ -63,7 +63,7 @@ if(NOT TARGET develop::json)
 endif()
 
 add_library(http STATIC ${HTTP_SOURCES})
-target_link_libraries(http PUBLIC develop::net develop::sched develop::json develop::sys develop::base)
+target_link_libraries(http PUBLIC develop::net develop::sched develop::json develop::log develop::sys develop::base)
 
 if(NOT WIN32 AND HTTP_WITH_IO_URING)
     # liburing (apt install liburing-dev, or a build of
