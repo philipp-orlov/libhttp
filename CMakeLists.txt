@@ -53,24 +53,17 @@ set(HTTP_SOURCES
     src/server.cpp
 )
 
-if(WIN32)
-    list(APPEND HTTP_SOURCES src/platform/windows/io_loop_iocp.cpp)
-elseif(HTTP_WITH_IO_URING)
-    list(APPEND HTTP_SOURCES src/platform/linux/io_loop_uring.cpp)
-else()
-    list(APPEND HTTP_SOURCES src/platform/linux/io_loop_epoll.cpp)
-endif()
-
 # develop-core supplies libbase (base64, UTF-8, SHA-1) and libjson: a sibling checkout by default, ignored when the
 # including project already provides the targets.
 set(HTTP_DEVELOP_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../develop-core" CACHE PATH "Path to a develop-core checkout")
 if(NOT TARGET develop::json)
     set(DEVELOP_BUILD_TESTS OFF CACHE BOOL "")
+    set(DEVELOP_NET_IO_URING ${HTTP_WITH_IO_URING} CACHE BOOL "" FORCE)
     add_subdirectory("${HTTP_DEVELOP_CORE_DIR}" develop-core)
 endif()
 
 add_library(http STATIC ${HTTP_SOURCES})
-target_link_libraries(http PUBLIC develop::json develop::sys develop::base)
+target_link_libraries(http PUBLIC develop::net develop::sched develop::json develop::sys develop::base)
 
 if(NOT WIN32 AND HTTP_WITH_IO_URING)
     # liburing (apt install liburing-dev, or a build of

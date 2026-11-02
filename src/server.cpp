@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "http/server.hpp"
+#include "net/log.hpp"
 #include "ws_out_queue.hpp"
 
 #include <cstring>
@@ -1794,6 +1795,13 @@ struct internal::SessionPool
 
 Server::Server(ServerConfig config) : config_(std::move(config))
 {
+    // libnet reports through a hook; route it into this library's logger.
+    net::setLogHook([](net::LogLevel level, const char* message) {
+        if (level == net::LogLevel::Error)
+            HTTP_LOG_ERROR("%s", message);
+        else
+            HTTP_LOG_WARN("%s", message);
+    });
     if ((!config_.httpEnabled && !config_.tls) ||
         (config_.tls && config_.httpEnabled && config_.port == config_.tls->port))
         throw std::invalid_argument(
