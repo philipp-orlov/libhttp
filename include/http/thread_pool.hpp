@@ -3,15 +3,14 @@
 
 #pragma once
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <functional>
-#include <mutex>
-#include <stdexcept>
-#include <thread>
-#include <vector>
+#include <memory>
+
+namespace sched {
+class ThreadPool;
+}
 
 namespace http {
 
@@ -19,6 +18,9 @@ namespace http {
 // reactor threads, so a slow request never blocks I/O for other
 // connections. Handlers submit work here and hop back onto their
 // connection's IoLoop (via IoLoop::Post) to write the response.
+// A facade over develop-core's sched::ThreadPool (bounded lock-free MPMC ring, futex parking): a std::function
+// task fits the ring's inline slot, so enqueueing allocates nothing beyond what the std::function itself holds.
+// The queue capacity is rounded up to a power of two.
 class ThreadPool
 {
 public:
@@ -32,31 +34,17 @@ public:
     ThreadPool& operator=(const ThreadPool&) = delete;
 
     void enqueue(std::function<void()> task);
-    // Queue slots are preallocated; a task's std::function target may allocate.
     // Rejection does not execute the task. shutdown drains and joins; call it
     // from the owning control thread, never a worker of this pool.
     bool tryEnqueue(std::function<void()> task);
     void shutdown();
-    size_t failedTasks() const { return failedTasks_.load(); }
+    size_t failedTasks() const;
     // Tasks refused because the queue was full or the pool stopped.
-    size_t rejectedTasks() const { return rejectedTasks_.load(); }
+    size_t rejectedTasks() const;
     size_t pendingTasks() const;
 
 private:
-    void workerLoop();
-
-    std::vector<std::thread> workers_;
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    std::vector<std::function<void()>> tasks_;
-    std::atomic<size_t> pending_{0};  // count_, readable without the lock (for the spin)
-    std::chrono::microseconds spin_{0};
-    size_t head_ = 0;
-    size_t tail_ = 0;
-    size_t count_ = 0;
-    std::atomic<size_t> failedTasks_{0};
-    std::atomic<size_t> rejectedTasks_{0};
-    bool stop_ = false;
+    std::unique_ptr<sched::ThreadPool> pool_;
 };
 
 }  // namespace http

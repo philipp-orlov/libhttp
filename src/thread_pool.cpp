@@ -3,22 +3,21 @@
 
 #include "http/thread_pool.hpp"
 
+#include <stdexcept>
+#include <utility>
+
+#include "sched/thread_pool.hpp"
+
 namespace http {
 
 ThreadPool::ThreadPool(size_t numThreads, size_t queueCapacity, std::chrono::microseconds spin)
-    : tasks_(queueCapacity), spin_(spin)
 {
     if (!numThreads || !queueCapacity)
         throw std::invalid_argument("worker count and queue capacity must be positive");
-
-    workers_.reserve(numThreads);
-    try {
-        for (size_t index = 0; index < numThreads; ++index)
-            workers_.emplace_back(&ThreadPool::workerLoop, this);
-    } catch (...) {
-        shutdown();
-        throw;
-    }
+    sched::ThreadPoolOptions options(static_cast<unsigned>(numThreads), queueCapacity);
+    options.spin = spin;
+    options.namePrefix = "http-worker";
+    pool_ = std::make_unique<sched::ThreadPool>(std::move(options));
 }
 
 ThreadPool::~ThreadPool()
@@ -28,15 +27,7 @@ ThreadPool::~ThreadPool()
 
 void ThreadPool::shutdown()
 {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stop_ = true;
-    }
-    cv_.notify_all();
-    for (auto& t : workers_) {
-        if (t.joinable())
-            t.join();
-    }
+    pool_->shutdown();
 }
 
 void ThreadPool::enqueue(std::function<void()> task)
@@ -45,64 +36,35 @@ void ThreadPool::enqueue(std::function<void()> task)
         throw std::runtime_error("worker queue full or stopped");
 }
 
-size_t ThreadPool::pendingTasks() const
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    return count_;
-}
-
 bool ThreadPool::tryEnqueue(std::function<void()> task)
 {
     if (!task)
         return false;
-
+    // The ring moves the wrapper only on success, so a rejected task is left untouched (and not run).
+    struct Run
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (stop_ || count_ == tasks_.size()) {
-            ++rejectedTasks_;
-            return false;
-        }
-        tasks_[tail_] = std::move(task);
-        tail_ = (tail_ + 1) % tasks_.size();
-        ++count_;
-        pending_.store(count_, std::memory_order_release);
-    }
-    cv_.notify_one();
-    return true;
+        std::function<void()> fn;
+        void operator()() { fn(); }
+    };
+    if constexpr (sizeof(Run) <= 48)   // libstdc++ / libc++: 32 / 48 bytes, fits the inline slot
+        return pool_->tryEnqueue(Run{std::move(task)});
+    else                               // MSVC's std::function is larger: one boxed allocation per task
+        return pool_->tryEnqueueBoxed(std::move(task));
 }
 
-void ThreadPool::workerLoop()
+size_t ThreadPool::failedTasks() const
 {
-    for (;;) {
-        std::function<void()> task;
-        if (spin_.count() > 0) {
-            const auto until = std::chrono::steady_clock::now() + spin_;
-            while (pending_.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < until) {
-#if defined(__x86_64__) || defined(__i386__)
-                __builtin_ia32_pause();
-#elif defined(__aarch64__)
-                asm volatile("yield" ::: "memory");
-#endif
-            }
-        }
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return stop_ || count_ != 0; });
-            if (stop_ && count_ == 0)
-                return;
+    return static_cast<size_t>(pool_->failedTasks());
+}
 
-            task = std::move(tasks_[head_]);
-            tasks_[head_] = nullptr;
-            head_ = (head_ + 1) % tasks_.size();
-            --count_;
-            pending_.store(count_, std::memory_order_release);
-        }
-        try {
-            task();
-        } catch (...) {
-            ++failedTasks_;
-        }
-    }
+size_t ThreadPool::rejectedTasks() const
+{
+    return static_cast<size_t>(pool_->rejectedTasks());
+}
+
+size_t ThreadPool::pendingTasks() const
+{
+    return pool_->pendingTasks();
 }
 
 }  // namespace http
