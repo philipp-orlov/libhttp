@@ -27,6 +27,8 @@ thread_local bool t_counting = false;
 std::atomic<unsigned long> g_news{0};
 }  // namespace
 
+// Counted only where the build allows replacing operator new (not under ThreadSanitizer, whose runtime defines it).
+#if HTTP_COUNTS_ALLOCATIONS
 void* operator new(size_t size)
 {
     if (t_counting)
@@ -37,6 +39,7 @@ void* operator new(size_t size)
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, size_t) noexcept { std::free(p); }
+#endif
 
 namespace {
 void expect(bool condition, const char* what)
@@ -370,8 +373,10 @@ void warmAllocations()
             expect(false, "echo");
     }
     t_counting = false;
+#if HTTP_COUNTS_ALLOCATIONS
     std::printf("warm sendBinary + receive of 64 KiB: %lu allocations in 200 round trips\n", g_news.load());
     expect(g_news.load() == 0, "no heap allocation per message once warm");
+#endif
 }
 }  // namespace
 
