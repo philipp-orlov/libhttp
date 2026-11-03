@@ -3,7 +3,7 @@
 
 #pragma once
 
-// Moved to develop-core's libsched (sched/task_queue.hpp).
+// Moved to libcore's libsched (sched/task_queue.hpp).
 #include <functional>
 
 #include "sched/task_queue.hpp"

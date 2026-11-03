@@ -53,13 +53,13 @@ set(HTTP_SOURCES
     src/server.cpp
 )
 
-# develop-core supplies libbase (base64, UTF-8, SHA-1) and libjson: a sibling checkout by default, ignored when the
+# libcore supplies libbase (base64, UTF-8, SHA-1) and libjson: a sibling checkout by default, ignored when the
 # including project already provides the targets.
-set(HTTP_DEVELOP_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../develop-core" CACHE PATH "Path to a develop-core checkout")
+set(HTTP_LIBCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libcore" CACHE PATH "Path to a libcore checkout")
 if(NOT TARGET develop::json)
     set(DEVELOP_BUILD_TESTS OFF CACHE BOOL "")
     set(DEVELOP_NET_IO_URING ${HTTP_WITH_IO_URING} CACHE BOOL "" FORCE)
-    add_subdirectory("${HTTP_DEVELOP_CORE_DIR}" develop-core)
+    add_subdirectory("${HTTP_LIBCORE_DIR}" libcore)
 endif()
 
 add_library(http STATIC ${HTTP_SOURCES})

@@ -3,7 +3,7 @@
 
 #pragma once
 
-// The validator lives in develop-core's libbase; this keeps the old name.
+// The validator lives in libcore's libbase; this keeps the old name.
 #include "base/utf8.hpp"
 
 namespace http {

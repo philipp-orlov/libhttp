@@ -18,7 +18,7 @@ namespace http {
 // reactor threads, so a slow request never blocks I/O for other
 // connections. Handlers submit work here and hop back onto their
 // connection's IoLoop (via IoLoop::Post) to write the response.
-// A facade over develop-core's sched::ThreadPool (bounded lock-free MPMC ring, futex parking): a std::function
+// A facade over libcore's sched::ThreadPool (bounded lock-free MPMC ring, futex parking): a std::function
 // task fits the ring's inline slot, so enqueueing allocates nothing beyond what the std::function itself holds.
 // The queue capacity is rounded up to a power of two.
 class ThreadPool

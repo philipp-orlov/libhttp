@@ -3,7 +3,7 @@
 
 #pragma once
 
-// The reactor loops (epoll, io_uring, IOCP) live in develop-core's libnet; this header keeps the old path and the
+// The reactor loops (epoll, io_uring, IOCP) live in libcore's libnet; this header keeps the old path and the
 // http:: names.
 #include "http/platform.hpp"
 #include "net/io_loop.hpp"

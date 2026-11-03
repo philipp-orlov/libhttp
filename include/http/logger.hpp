@@ -22,7 +22,7 @@ enum class LogLevel
     Off
 };
 
-// Async logger, now a thin facade over develop-core's liblog (lg::Logger): each producer thread formats straight
+// Async logger, now a thin facade over libcore's liblog (lg::Logger): each producer thread formats straight
 // into its own lock-free ring (no lock, no syscall, no allocation after its first line); one consumer thread
 // escapes control characters, adds the local-time prefix and writes to the sinks (console on stdout, file).
 class Logger

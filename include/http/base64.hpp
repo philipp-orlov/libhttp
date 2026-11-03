@@ -3,7 +3,7 @@
 
 #pragma once
 
-// base64 lives in develop-core's libbase; these keep the old names.
+// base64 lives in libcore's libbase; these keep the old names.
 #include <cstdint>
 #include <string>
 #include <string_view>

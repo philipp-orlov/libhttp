@@ -3,7 +3,7 @@
 
 #pragma once
 
-// Moved to develop-core's libsched (sched/timer_heap.hpp).
+// Moved to libcore's libsched (sched/timer_heap.hpp).
 #include <functional>
 
 #include "sched/timer_heap.hpp"

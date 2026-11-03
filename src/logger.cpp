@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
-// http::Logger is a facade over lg::Logger (develop-core liblog). The level enums have the same order, so levels
+// http::Logger is a facade over lg::Logger (libcore liblog). The level enums have the same order, so levels
 // convert by value. The facade owns one lg::Logger with 1 KiB lines (libhttp's record size) and local timestamps.
 
 #include "http/logger.hpp"

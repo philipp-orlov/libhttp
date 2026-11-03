@@ -28,15 +28,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: philipp-orlov/develop-core
-          path: develop-core
+          repository: philipp-orlov/libcore
+          path: libcore
           ref: main
       - name: Dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libssl-dev clang
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja
-          -DHTTP_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DHTTP_LIBCORE_DIR=$GITHUB_WORKSPACE/libcore -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           -DHTTP_WITH_SSL=ON
           -DBUILD_TESTING=ON
@@ -63,14 +63,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: philipp-orlov/develop-core
-          path: develop-core
+          repository: philipp-orlov/libcore
+          path: libcore
           ref: main
       - name: Dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libssl-dev clang
       - name: Build
         run: >
-          cmake -S . -B build -G Ninja -DHTTP_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++
+          cmake -S . -B build -G Ninja -DHTTP_LIBCORE_DIR=$GITHUB_WORKSPACE/libcore -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++
           -DHTTP_BUILD_FUZZ=ON -DHTTP_BUILD_TESTS=OFF -DHTTP_BUILD_EXAMPLES=OFF
           && cmake --build build --target fuzz_${{ matrix.target }}
       - name: Fuzz for two minutes

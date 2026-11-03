@@ -3,7 +3,7 @@
 
 #pragma once
 
-// Platform detection and socket primitives. They live in develop-core's libsys (sys/net.hpp); this header keeps the
+// Platform detection and socket primitives. They live in libcore's libsys (sys/net.hpp); this header keeps the
 // old path and the http:: names.
 #if defined(_WIN32)
 #define HTTP_WINDOWS 1
