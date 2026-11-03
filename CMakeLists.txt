@@ -57,8 +57,8 @@ set(HTTP_SOURCES
 # including project already provides the targets.
 set(HTTP_LIBCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libcore" CACHE PATH "Path to a libcore checkout")
 if(NOT TARGET core::json)
-    set(DEVELOP_BUILD_TESTS OFF CACHE BOOL "")
-    set(DEVELOP_NET_IO_URING ${HTTP_WITH_IO_URING} CACHE BOOL "" FORCE)
+    set(CORE_BUILD_TESTS OFF CACHE BOOL "")
+    set(CORE_NET_IO_URING ${HTTP_WITH_IO_URING} CACHE BOOL "" FORCE)
     add_subdirectory("${HTTP_LIBCORE_DIR}" libcore)
 endif()
 
@@ -211,9 +211,9 @@ if(HTTP_BUILD_TESTS AND BUILD_TESTING)
         add_test(NAME http_float_formats COMMAND http_test_float_formats)
         # The same test on the snprintf/strtod path of a standard library without
         # floating-point <charconv> (libstdc++ before 11, e.g. GCC 9 on JetPack 5).
-        add_executable(http_test_float_fallback tests/test_float_formats.cpp $<TARGET_PROPERTY:develop_json,SOURCE_DIR>/src/json.cpp
+        add_executable(http_test_float_fallback tests/test_float_formats.cpp $<TARGET_PROPERTY:core_json,SOURCE_DIR>/src/json.cpp
                                                 src/parameters.cpp)
-        target_include_directories(http_test_float_fallback PRIVATE include $<TARGET_PROPERTY:develop_json,SOURCE_DIR>/include)
+        target_include_directories(http_test_float_fallback PRIVATE include $<TARGET_PROPERTY:core_json,SOURCE_DIR>/include)
         target_link_libraries(http_test_float_fallback PRIVATE core::base)
         target_compile_features(http_test_float_fallback PRIVATE cxx_std_17)
         target_compile_definitions(http_test_float_fallback PRIVATE JSON_FP_CHARCONV=0
