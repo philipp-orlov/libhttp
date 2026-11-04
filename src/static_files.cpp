@@ -115,14 +115,14 @@ bool normalizeRelativePath(std::string_view path, std::string& outRelative)
 
         pos = slash + 1;
     }
-    std::ostringstream oss;
+    outRelative.clear();
+    outRelative.reserve(path.size());
     for (size_t i = 0; i < stack.size(); ++i) {
         if (i > 0)
-            oss << '/';
+            outRelative += '/';
 
-        oss << stack[i];
+        outRelative.append(stack[i].data(), stack[i].size());
     }
-    outRelative = oss.str();
     return true;
 }
 

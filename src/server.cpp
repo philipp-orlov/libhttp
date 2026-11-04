@@ -35,11 +35,6 @@ constexpr size_t kMaxCoalescedBodyBytes = 64 * 1024;
 // previous batch by then, parsing pauses until it has (see processHttp).
 constexpr size_t kFlushThresholdBytes = 64 * 1024;
 
-// A request body block larger than this goes back to the pool once the
-// request is answered instead of staying leased to an idle connection; and
-// no buffer of a Session that goes back to its pool keeps more than this.
-constexpr size_t kMaxRetainedBodyBytes = 64 * 1024;
-
 // A flush that hands a head and a large body to the socket in one call can
 // finish the write on the spot and go on to the next pipelined request from
 // there; past this many such completions nested on one thread it takes the
@@ -164,6 +159,25 @@ bool listedIgnoreCase(const std::vector<std::string>& list, std::string_view val
         if (equalsIgnoreCase(item, value))
             return true;
 
+    return false;
+}
+
+// Whether a comma-separated header value lists `token`, exactly.
+bool offersToken(std::string_view offers, std::string_view token)
+{
+    while (!offers.empty()) {
+        const size_t comma = offers.find(',');
+        std::string_view item = offers.substr(0, comma);
+        while (!item.empty() && (item.front() == ' ' || item.front() == '\t'))
+            item.remove_prefix(1);
+        while (!item.empty() && (item.back() == ' ' || item.back() == '\t'))
+            item.remove_suffix(1);
+        if (item == token)
+            return true;
+        if (comma == std::string_view::npos)
+            break;
+        offers.remove_prefix(comma + 1);
+    }
     return false;
 }
 
@@ -503,7 +517,7 @@ private:
         keepUnconsumed(input, offset);
         // A block grown for a long head or a pipelined burst goes back to
         // the pool rather than staying leased to this connection.
-        if (readBuffer_.empty() && readBuffer_.capacity() > kMaxRetainedBodyBytes)
+        if (readBuffer_.empty() && readBuffer_.capacity() > server_.config().maxRetainedSessionBytes)
             readBuffer_ = Buffer(server_.buffers_);
 
         processing_ = false;
@@ -938,6 +952,16 @@ private:
             sendResponse();
             return;
         }
+        if (server_.config().allowedOrigins.empty() && server_.config().webSocketSameOrigin && !origin.empty()) {
+            const size_t scheme = origin.find("://");
+            const std::string_view originHost =
+                hostWithoutPort(scheme == std::string_view::npos ? origin : origin.substr(scheme + 3));
+            if (!equalsIgnoreCase(originHost, hostWithoutPort(request_.headers.get("Host")))) {
+                context_.status(403).text("Forbidden: cross-site WebSocket");
+                sendResponse();
+                return;
+            }
+        }
         // Sub-protocol: the first of the client's offers the route lists.
         std::string chosen;
         if (!route.options.subprotocols.empty()) {
@@ -975,7 +999,9 @@ private:
                 return;
             }
             userData = std::move(decision.userData);
-            if (!decision.subprotocol.empty() && decision.subprotocol == chosen)
+            // RFC 6455: the server may only pick a protocol the client offered.
+            if (!decision.subprotocol.empty() &&
+                offersToken(request_.headers.get("Sec-WebSocket-Protocol"), decision.subprotocol))
                 chosen = decision.subprotocol;
         }
         webSocketMaxMessageBytes_ = route.options.maxMessageBytes
@@ -1204,7 +1230,7 @@ private:
                 webSocketFrameBytesNeeded_ = 0;
                 // A block grown for one big frame goes back to the pool
                 // rather than staying leased to this connection.
-                if (readBuffer_.capacity() > kMaxRetainedBodyBytes)
+                if (readBuffer_.capacity() > server_.config().maxRetainedSessionBytes)
                     readBuffer_ = Buffer(server_.buffers_);
             }
             resetTimeout();
@@ -1480,7 +1506,7 @@ private:
         request_.versionMajor = 1;
         request_.versionMinor = 1;
         request_.headers.clear();
-        if (request_.body.capacity() > kMaxRetainedBodyBytes)
+        if (request_.body.capacity() > server_.config().maxRetainedSessionBytes)
             request_.body = Buffer(server_.buffers_);
         else
             request_.body.clear();
@@ -1677,14 +1703,15 @@ private:
         retainedBytes_ = kept;
     }
 
-    // Frees every buffer that grew past kMaxRetainedBodyBytes while it served
+    // Frees every buffer that grew past server_.config().maxRetainedSessionBytes while it served
     // the connection, so that what a pooled Session keeps does not depend on
     // the largest message it ever carried. Returns the capacity kept.
     size_t trimRetained()
     {
         size_t kept = 0;
-        const auto trim = [&kept](std::string& text, size_t reserve = 0) {
-            if (text.capacity() > kMaxRetainedBodyBytes) {
+        const size_t limit = server_.config().maxRetainedSessionBytes;
+        const auto trim = [&kept, limit](std::string& text, size_t reserve = 0) {
+            if (text.capacity() > limit) {
                 std::string().swap(text);
                 text.reserve(reserve);
             }
@@ -1699,10 +1726,10 @@ private:
         trim(request_.head);
         trim(request_.decodedPath);
         trim(peerAddress_);
-        if (readBuffer_.capacity() > kMaxRetainedBodyBytes)
+        if (readBuffer_.capacity() > server_.config().maxRetainedSessionBytes)
             readBuffer_ = Buffer(server_.buffers_);
 
-        if (request_.body.capacity() > kMaxRetainedBodyBytes)
+        if (request_.body.capacity() > server_.config().maxRetainedSessionBytes)
             request_.body = Buffer(server_.buffers_);
 
         if (response_.pooledBody.capacity())
@@ -1712,8 +1739,8 @@ private:
             largePooledBody_ = Buffer();
 
         kept += readBuffer_.capacity() + request_.body.capacity();
-        kept += response_.headers.trimSpare(kMaxRetainedBodyBytes);
-        kept += context_.trimSpare(kMaxRetainedBodyBytes);
+        kept += response_.headers.trimSpare(server_.config().maxRetainedSessionBytes);
+        kept += context_.trimSpare(server_.config().maxRetainedSessionBytes);
         return kept;
     }
 
@@ -2066,7 +2093,11 @@ void Server::run(std::function<bool()> shouldStop, std::function<void()> onListe
     {
         std::unique_lock<std::mutex> lock(stopMutex_);
         while (running_) {
-            stopCv_.wait_for(lock, std::chrono::milliseconds(100));
+            // Poll only when a shouldStop callback has to be asked; otherwise sleep until stop().
+            if (shouldStop)
+                stopCv_.wait_for(lock, std::chrono::milliseconds(100));
+            else
+                stopCv_.wait(lock);
             try {
                 if (shouldStop && shouldStop())
                     running_ = false;
@@ -2136,9 +2167,12 @@ Server::Stats Server::stats() const
 
 void Server::stop()
 {
-    if (!running_.exchange(false))
-        return;
-
+    {
+        // Under the lock: run() may sit in an untimed wait, and must not miss this.
+        std::lock_guard<std::mutex> lock(stopMutex_);
+        if (!running_.exchange(false))
+            return;
+    }
     stopCv_.notify_all();
 }
 

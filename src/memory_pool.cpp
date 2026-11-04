@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "http/logger.hpp"
+#include "sys/vm.hpp"
 
 namespace http {
 
@@ -18,6 +19,9 @@ namespace {
 MemoryAllocateFn g_customAllocate;
 MemoryDeallocateFn g_customDeallocate;
 std::atomic<bool> allocatorFrozen{false};
+
+// Blocks at least this large give their pages back when released.
+constexpr size_t kDiscardBlockBytes = 1024 * 1024;
 
 // How many classes above its own a request may borrow from.
 constexpr size_t kMaxBorrowClasses = 4;
@@ -182,6 +186,10 @@ void SlabPool::release(void* p) noexcept
     }
     in_use_[index / 64] &= ~mask;
     free_list_ = new (p) FreeNode{free_list_, index};
+    // A large block goes back to the OS, except the page holding the free-list node, so one big upload does not pin
+    // its size in RSS for the life of the process. Custom allocators may not hand out anonymous memory: left alone.
+    if (block_size_ >= kDiscardBlockBytes && !g_customAllocate)
+        sys::vmDiscard(static_cast<unsigned char*>(p) + sizeof(FreeNode), block_size_ - sizeof(FreeNode));
 }
 
 size_t SlabPool::blockIndex(const void* pointer) const noexcept

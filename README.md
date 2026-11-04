@@ -196,6 +196,23 @@ the answers that matter most can avoid the copy:
 - **Idle loops sleep.** A loop with nothing to do waits for its next timer, or
   for work, without waking on its own.
 
+### Settings for a small device
+
+These values are starting points for a small device. They were not tuned on real hardware, so adjust them to the device; the defaults suit a large machine.
+
+```cpp
+http::ServerConfig c;
+c.ioThreads = 2;                                // default: one per core
+c.workerThreads = 2;                            // default 2
+c.maxConnectionsPerLoop = 64;                   // default 256
+c.maxBodyBytes = 16u << 20;                     // default 256 MiB
+c.maxRetainedSessionBytes = 8 * 1024;           // default 64 KiB
+
+http::BufferPool::Config pool;                  // before the server starts
+pool.maxBytes = 64u << 20;                      // default 512 MiB
+http::BufferPool::shared().configure(pool);
+```
+
 ## Building
 
 ```sh

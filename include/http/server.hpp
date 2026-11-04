@@ -62,6 +62,13 @@ struct ServerConfig
     size_t maxConnectionsPerIp = 0;
     size_t maxWebSocketMessageBytes = 1024 * 1024;
     size_t maxWebSocketQueuedBytes = 4 * 1024 * 1024;
+    // The largest buffer a connection keeps between requests, and that an idle pooled Session keeps. Lower it on a
+    // small device: what stays allocated after a burst is about ioThreads x maxConnectionsPerLoop x 6 x this.
+    size_t maxRetainedSessionBytes = 64 * 1024;
+    // A browser sends Origin on a WebSocket handshake and does not confine it to the page's own site. Off by
+    // default, so cross-site sockets are accepted. When true and allowedOrigins is empty, refuse an Origin whose
+    // host differs from the Host header. Clients other than browsers send no Origin and are not affected.
+    bool webSocketSameOrigin = false;
     size_t maxWebSocketQueuedFrames = 256;
     // What a send does when the frames waiting for a slow client would pass
     // maxWebSocketQueuedFrames or maxWebSocketQueuedBytes: false closes the
