@@ -143,8 +143,15 @@ if(HTTP_WITH_SSL)
     get_filename_component(HTTP_OPENSSL_LIBDIR "${OPENSSL_CRYPTO_LIBRARY}" DIRECTORY)
 
     target_include_directories(http SYSTEM PUBLIC ${OPENSSL_INCLUDE_DIR})
-    target_link_directories(http PUBLIC ${HTTP_OPENSSL_LIBDIR})
-    target_link_libraries(http PUBLIC ssl crypto)
+    if(WIN32)
+        # The libraries are libssl.lib and libcrypto.lib there, and there is no static-versus-shared choice to leave to
+        # the consumer's linker: the imported targets name them. crypt32 is the Windows certificate store, which the
+        # WebSocket client reads for the trusted roots.
+        target_link_libraries(http PUBLIC OpenSSL::SSL OpenSSL::Crypto crypt32)
+    else()
+        target_link_directories(http PUBLIC ${HTTP_OPENSSL_LIBDIR})
+        target_link_libraries(http PUBLIC ssl crypto)
+    endif()
     target_compile_definitions(http PUBLIC HTTP_WITH_SSL=1)
 endif()
 

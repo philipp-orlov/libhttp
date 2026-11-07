@@ -18,14 +18,18 @@
 #include "http/platform.hpp"
 #include "http/websocket.hpp"
 
-#if defined(HTTP_WITH_SSL) && !defined(HTTP_WINDOWS)
+#if defined(HTTP_WITH_SSL)
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #define HTTP_WS_CLIENT_TLS 1
 #endif
 
-#if !defined(HTTP_WINDOWS)
+#if defined(HTTP_WINDOWS)
+#include <wincrypt.h>
+#pragma comment(lib, "crypt32.lib")
+#else
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -69,6 +73,110 @@ int millisUntil(Clock::time_point when)
         return 0;
     return left > 0x7fffffff ? 0x7fffffff : static_cast<int>(left);
 }
+
+// poll(2) and WSAPoll take the same arguments; only the type and the name differ.
+#if defined(HTTP_WINDOWS)
+using PollFd = WSAPOLLFD;
+int pollSockets(PollFd* fds, unsigned count, int timeoutMillis) { return ::WSAPoll(fds, count, timeoutMillis); }
+constexpr int kShutdownBoth = SD_BOTH;
+constexpr int kSendFlags = 0;
+using SignedSize = int;
+#else
+using PollFd = pollfd;
+int pollSockets(PollFd* fds, unsigned count, int timeoutMillis) { return ::poll(fds, static_cast<nfds_t>(count), timeoutMillis); }
+constexpr int kShutdownBoth = SHUT_RDWR;
+#ifdef MSG_NOSIGNAL
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kSendFlags = 0;
+#endif
+using SignedSize = ssize_t;
+#endif
+
+// The text of a socket error (an errno value on POSIX, a WSA code on Windows).
+std::string socketErrorText(int error)
+{
+#if defined(HTTP_WINDOWS)
+    char* text = nullptr;
+    const DWORD n = ::FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                     nullptr, static_cast<DWORD>(error), 0, reinterpret_cast<char*>(&text), 0, nullptr);
+    std::string message = n > 0 && text ? std::string(text, n) : "error " + std::to_string(error);
+    if (text)
+        ::LocalFree(text);
+    while (!message.empty() && (message.back() == '\n' || message.back() == '\r' || message.back() == ' '))
+        message.pop_back();
+    return message;
+#else
+    return std::strerror(error);
+#endif
+}
+
+// The text of a getaddrinfo failure.
+std::string resolveErrorText(int code)
+{
+#if defined(HTTP_WINDOWS)
+    return socketErrorText(code);  // getaddrinfo reports WSA codes there
+#else
+    return ::gai_strerror(code);
+#endif
+}
+
+bool interrupted(int error)
+{
+#if defined(HTTP_WINDOWS)
+    return error == WSAEINTR;
+#else
+    return error == EINTR;
+#endif
+}
+
+// A non-blocking connect() that has not finished: EINPROGRESS on POSIX, WSAEWOULDBLOCK on Windows.
+bool connectPending(int error)
+{
+#if defined(HTTP_WINDOWS)
+    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
+#else
+    return error == EINPROGRESS;
+#endif
+}
+
+void setBlocking(sys::socket_t socket)
+{
+#if defined(HTTP_WINDOWS)
+    u_long off = 0;
+    ::ioctlsocket(socket, FIONBIO, &off);
+#else
+    const int flags = ::fcntl(socket, F_GETFL, 0);
+    ::fcntl(socket, F_SETFL, flags & ~O_NONBLOCK);
+#endif
+}
+
+#if defined(HTTP_WS_CLIENT_TLS) && defined(HTTP_WINDOWS)
+// OpenSSL does not read the Windows certificate store, so the machine's trusted roots are handed over one by one.
+// Returns how many were added.
+int loadWindowsRoots(SSL_CTX* context)
+{
+    X509_STORE* store = SSL_CTX_get_cert_store(context);
+    int added = 0;
+    for (const char* name : {"ROOT", "CA"}) {
+        HCERTSTORE system = ::CertOpenSystemStoreA(0, name);
+        if (!system)
+            continue;
+        for (PCCERT_CONTEXT certificate = ::CertEnumCertificatesInStore(system, nullptr); certificate;
+             certificate = ::CertEnumCertificatesInStore(system, certificate)) {
+            const unsigned char* bytes = certificate->pbCertEncoded;
+            if (X509* parsed = d2i_X509(nullptr, &bytes, static_cast<long>(certificate->cbCertEncoded))) {
+                if (X509_STORE_add_cert(store, parsed) == 1)
+                    ++added;
+                X509_free(parsed);
+            }
+        }
+        ::CertCloseStore(system, 0);
+    }
+    ERR_clear_error();  // adding a certificate twice is not a failure
+    return added;
+}
+#endif
 
 }  // namespace
 
@@ -123,37 +231,11 @@ WebSocketUrl parseWebSocketUrl(std::string_view url)
     return out;
 }
 
-#if defined(HTTP_WINDOWS)
-
-struct WebSocketClient::Impl
+#if defined(HTTP_WS_CLIENT_TLS) && defined(HTTP_WINDOWS)
+// Windows raises no SIGPIPE.
+struct NoSigpipe
 {};
-WebSocketClient::WebSocketClient() = default;
-WebSocketClient::~WebSocketClient() = default;
-WebSocketClient::WebSocketClient(WebSocketClient&&) noexcept = default;
-WebSocketClient& WebSocketClient::operator=(WebSocketClient&&) noexcept = default;
-void WebSocketClient::connect(std::string_view, const WebSocketClientOptions&)
-{
-    throw WebSocketError(Kind::Usage, "WebSocketClient is not implemented on Windows yet");
-}
-bool WebSocketClient::isOpen() const noexcept { return false; }
-const std::string& WebSocketClient::subprotocol() const noexcept
-{
-    static const std::string none;
-    return none;
-}
-void WebSocketClient::sendBinary(const void*, size_t) {}
-void WebSocketClient::sendText(std::string_view) {}
-void WebSocketClient::ping(std::string_view) {}
-std::optional<WebSocketClient::Message> WebSocketClient::receive(Clock::time_point, std::chrono::milliseconds)
-{
-    return std::nullopt;
-}
-bool WebSocketClient::peerClosed() { return true; }
-void WebSocketClient::close(uint16_t, std::string_view) noexcept {}
-
-#else
-
-#ifdef HTTP_WS_CLIENT_TLS
+#elif defined(HTTP_WS_CLIENT_TLS)
 // Holds SIGPIPE back on this thread for a scope; one raised by the writes inside is swallowed.
 struct NoSigpipe
 {
@@ -181,7 +263,7 @@ struct NoSigpipe
 
 struct WebSocketClient::Impl
 {
-    int fd = -1;
+    sys::socket_t fd = sys::kInvalidSocket;
     // open: the connection is usable. Cleared by abortSocket() from any thread; the descriptor and the TLS state
     // are only released by releaseSocket() (destructor, connect), when no other thread is inside the client.
     std::atomic<bool> open{false};
@@ -227,11 +309,13 @@ struct WebSocketClient::Impl
     // Waits for the socket in the direction OpenSSL asked for.
     void tlsWait(int sslError, Clock::time_point deadline)
     {
-        pollfd p{fd, static_cast<short>(sslError == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN), 0};
+        PollFd p{};
+        p.fd = fd;
+        p.events = static_cast<short>(sslError == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN);
         const int ms = deadline == Clock::time_point::max() ? 1000 : millisUntil(deadline);
-        const int ready = ::poll(&p, 1, ms);
-        if (ready < 0 && errno != EINTR)
-            throw WebSocketError(Kind::Io, std::string("poll failed: ") + std::strerror(errno));
+        const int ready = pollSockets(&p, 1, ms);
+        if (ready < 0 && !interrupted(sys::lastSocketError()))
+            throw WebSocketError(Kind::Io, "poll failed: " + socketErrorText(sys::lastSocketError()));
     }
 
     void tlsHandshake(const WebSocketUrl& url, const WebSocketClientOptions& options, Clock::time_point deadline)
@@ -241,18 +325,25 @@ struct WebSocketClient::Impl
             throw WebSocketError(Kind::Tls, tlsErrors("SSL_CTX_new"));
         SSL_CTX_set_min_proto_version(sslContext, TLS1_2_VERSION);
         SSL_CTX_set_mode(sslContext, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+#ifdef SSL_OP_IGNORE_UNEXPECTED_EOF  // OpenSSL 3; older versions already report this as a plain end of stream
         SSL_CTX_set_options(sslContext, SSL_OP_IGNORE_UNEXPECTED_EOF);
+#endif
         if (options.insecureSkipVerify) {
             SSL_CTX_set_verify(sslContext, SSL_VERIFY_NONE, nullptr);
         } else {
             SSL_CTX_set_verify(sslContext, SSL_VERIFY_PEER, nullptr);
+#if defined(HTTP_WINDOWS)
+            const int loaded = options.caFile.empty() ? (loadWindowsRoots(sslContext) > 0 ? 1 : 0)
+                                                      : SSL_CTX_load_verify_locations(sslContext, options.caFile.c_str(), nullptr);
+#else
             const int loaded = options.caFile.empty() ? SSL_CTX_set_default_verify_paths(sslContext)
                                                       : SSL_CTX_load_verify_locations(sslContext, options.caFile.c_str(), nullptr);
+#endif
             if (loaded != 1)
                 throw WebSocketError(Kind::Tls, tlsErrors("cannot load the trusted certificates"));
         }
         ssl = SSL_new(sslContext);
-        if (!ssl || SSL_set_fd(ssl, fd) != 1)
+        if (!ssl || SSL_set_fd(ssl, static_cast<int>(fd)) != 1)
             throw WebSocketError(Kind::Tls, tlsErrors("SSL_new"));
         // Host name checks (an IP literal is matched against the certificate's IP entries).
         in6_addr probe;
@@ -317,7 +408,7 @@ struct WebSocketClient::Impl
     }
 
     // One SSL_read into `chunk`; 0 when nothing is ready, -1 at the end of the stream.
-    ssize_t tlsRecv(char* chunk, size_t size)
+    SignedSize tlsRecv(char* chunk, size_t size)
     {
         std::lock_guard<std::mutex> lock(tlsMutex);
         if (!ssl)
@@ -329,7 +420,11 @@ struct WebSocketClient::Impl
         const int error = SSL_get_error(ssl, got);
         if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
             return 0;
+#if defined(HTTP_WINDOWS)
+        if (error == SSL_ERROR_ZERO_RETURN || (error == SSL_ERROR_SYSCALL && ERR_peek_error() == 0))
+#else
         if (error == SSL_ERROR_ZERO_RETURN || (error == SSL_ERROR_SYSCALL && errno == 0))
+#endif
             return -1;
         throw WebSocketError(Kind::Io, tlsErrors("TLS receive failed"));
     }
@@ -347,9 +442,9 @@ struct WebSocketClient::Impl
     void abortSocket() noexcept
     {
         open = false;
-        const int descriptor = fd;
-        if (descriptor >= 0)
-            ::shutdown(descriptor, SHUT_RDWR);
+        const sys::socket_t descriptor = fd;
+        if (descriptor != sys::kInvalidSocket)
+            ::shutdown(descriptor, kShutdownBoth);
     }
 
     void releaseSocket() noexcept
@@ -360,7 +455,7 @@ struct WebSocketClient::Impl
             // One critical section: another thread may be inside SSL_read or SSL_write.
             std::lock_guard<std::mutex> lock(tlsMutex);
             if (ssl) {
-                if (fd >= 0) {
+                if (fd != sys::kInvalidSocket) {
                     NoSigpipe guard;
                     SSL_shutdown(ssl);
                 }  // close_notify, best effort; the socket is non-blocking
@@ -373,9 +468,9 @@ struct WebSocketClient::Impl
             }
         }
 #endif
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
+        if (fd != sys::kInvalidSocket) {
+            sys::closeSocket(fd);
+            fd = sys::kInvalidSocket;
         }
     }
 
@@ -398,12 +493,17 @@ struct WebSocketClient::Impl
         }
 #endif
         while (size) {
-            const ssize_t sent = ::send(fd, data, size, MSG_NOSIGNAL);
+#if defined(HTTP_WINDOWS)
+            const SignedSize sent = ::send(fd, data, static_cast<int>(std::min<size_t>(size, 1u << 30)), kSendFlags);
+#else
+            const SignedSize sent = ::send(fd, data, size, kSendFlags);
+#endif
             if (sent < 0) {
-                if (errno == EINTR)
+                const int error = sys::lastSocketError();
+                if (interrupted(error))
                     continue;
                 abortSocket();
-                throw WebSocketError(Kind::Io, std::string("send failed: ") + std::strerror(errno));
+                throw WebSocketError(Kind::Io, "send failed: " + socketErrorText(error));
             }
             data += sent;
             size -= static_cast<size_t>(sent);
@@ -442,14 +542,17 @@ struct WebSocketClient::Impl
         if (secure && tlsPending())
             return readSome();
 #endif
-        pollfd p{fd, POLLIN, 0};
+        PollFd p{};
+        p.fd = fd;
+        p.events = POLLIN;
         for (;;) {
-            const int ready = ::poll(&p, 1, millisUntil(deadline));
+            const int ready = pollSockets(&p, 1, millisUntil(deadline));
             if (ready < 0) {
-                if (errno == EINTR)
+                const int error = sys::lastSocketError();
+                if (interrupted(error))
                     continue;
                 abortSocket();
-                throw WebSocketError(Kind::Io, std::string("poll failed: ") + std::strerror(errno));
+                throw WebSocketError(Kind::Io, "poll failed: " + socketErrorText(error));
             }
             if (ready == 0)
                 return false;
@@ -470,7 +573,7 @@ struct WebSocketClient::Impl
         char chunk[16384];
 #ifdef HTTP_WS_CLIENT_TLS
         if (secure) {
-            ssize_t got;
+            SignedSize got;
             try {
                 got = tlsRecv(chunk, sizeof(chunk));
             } catch (...) {
@@ -486,12 +589,13 @@ struct WebSocketClient::Impl
             return true;
         }
 #endif
-        const ssize_t got = ::recv(fd, chunk, sizeof(chunk), 0);
+        const SignedSize got = ::recv(fd, chunk, static_cast<int>(sizeof(chunk)), 0);
         if (got < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            const int error = sys::lastSocketError();
+            if (interrupted(error) || sys::wouldBlock(error))
                 return true;
             abortSocket();
-            throw WebSocketError(Kind::Io, std::string("recv failed: ") + std::strerror(errno));
+            throw WebSocketError(Kind::Io, "recv failed: " + socketErrorText(error));
         }
         if (got == 0) {
             abortSocket();
@@ -607,57 +711,59 @@ void WebSocketClient::connect(std::string_view urlText, const WebSocketClientOpt
         m.maskState = (static_cast<uint32_t>(source()) | 1u);
     }
 
+    static const sys::Pal networking;  // WSAStartup on Windows, once for the process; nothing elsewhere
+    (void)networking;
     addrinfo hints{};
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* found = nullptr;
     const std::string port = std::to_string(url.port);
     if (const int rc = ::getaddrinfo(url.host.c_str(), port.c_str(), &hints, &found); rc != 0 || !found)
-        throw WebSocketError(Kind::Connect, "cannot resolve " + url.host + ": " + ::gai_strerror(rc));
+        throw WebSocketError(Kind::Connect, "cannot resolve " + url.host + ": " + resolveErrorText(rc));
     const Clock::time_point deadline = Clock::now() + options.connectTimeout;
     std::string lastError = "no address";
-    int fd = -1;
-    for (addrinfo* a = found; a && fd < 0; a = a->ai_next) {
-        const int s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (s < 0) {
-            lastError = std::strerror(errno);
+    sys::socket_t fd = sys::kInvalidSocket;
+    for (addrinfo* a = found; a && fd == sys::kInvalidSocket; a = a->ai_next) {
+        const sys::socket_t s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (s == sys::kInvalidSocket) {
+            lastError = socketErrorText(sys::lastSocketError());
             continue;
         }
-        const int flags = ::fcntl(s, F_GETFL, 0);
-        ::fcntl(s, F_SETFL, flags | O_NONBLOCK);
-        int rc = ::connect(s, a->ai_addr, a->ai_addrlen);
-        if (rc < 0 && errno == EINPROGRESS) {
-            pollfd p{s, POLLOUT, 0};
-            rc = ::poll(&p, 1, millisUntil(deadline));
+        sys::setNonBlocking(s);
+        int rc = ::connect(s, a->ai_addr, static_cast<socklen_t>(a->ai_addrlen));
+        if (rc < 0 && connectPending(sys::lastSocketError())) {
+            PollFd p{};
+            p.fd = s;
+            p.events = POLLOUT;
+            rc = pollSockets(&p, 1, millisUntil(deadline));
             if (rc > 0) {
                 int error = 0;
                 socklen_t size = sizeof(error);
-                ::getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &size);
+                ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &size);
                 if (error == 0) {
                     rc = 0;
                 } else {
-                    lastError = std::strerror(error);
+                    lastError = socketErrorText(error);
                     rc = -1;
                 }
             } else {
-                lastError = rc == 0 ? "connect timed out" : std::strerror(errno);
+                lastError = rc == 0 ? "connect timed out" : socketErrorText(sys::lastSocketError());
                 rc = -1;
             }
         } else if (rc < 0) {
-            lastError = std::strerror(errno);
+            lastError = socketErrorText(sys::lastSocketError());
         }
         if (rc == 0) {
             if (!url.secure)
-                ::fcntl(s, F_SETFL, flags);  // TLS keeps the socket non-blocking
+                setBlocking(s);  // TLS keeps the socket non-blocking
             fd = s;
         } else {
-            ::close(s);
+            sys::closeSocket(s);
         }
     }
     ::freeaddrinfo(found);
-    if (fd < 0)
+    if (fd == sys::kInvalidSocket)
         throw WebSocketError(Kind::Connect, "cannot connect to " + url.host + ":" + port + ": " + lastError);
-    const int one = 1;
-    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    sys::setTcpNoDelay(fd);
     m.fd = fd;
 
     // Handshake.
@@ -853,12 +959,14 @@ bool WebSocketClient::peerClosed()
     if (!m.open)
         return true;
     try {
-        pollfd p{m.fd, POLLIN, 0};
+        PollFd p{};
+        p.fd = m.fd;
+        p.events = POLLIN;
         while (
 #ifdef HTTP_WS_CLIENT_TLS
             (m.secure && m.tlsPending()) ||
 #endif
-            (::poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR)))) {
+            (pollSockets(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR)))) {
             m.readSome();  // throws Closed on end of stream
             p.revents = 0;
         }
@@ -875,7 +983,5 @@ void WebSocketClient::close(uint16_t code, std::string_view reason) noexcept
         m.sendCloseFrame(code, reason);
     m.abortSocket();  // safe against a thread blocked in receive(): it wakes with Closed
 }
-
-#endif
 
 }  // namespace http
