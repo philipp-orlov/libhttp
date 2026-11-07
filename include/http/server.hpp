@@ -86,6 +86,11 @@ struct ServerConfig
     size_t maxHeaderBytes = 64 * 1024;
     size_t maxBodyBytes = 256ull * 1024 * 1024;  // generous cap for image uploads
     int keepAliveTimeoutSeconds = 75;
+    // Every this many seconds each loop looks over its WebSocket connections;
+    // one that has carried nothing since the last look, and has nothing half
+    // read or written, gives its buffers back (a few KiB each: what lets a
+    // server hold very many idle sockets). Busy connections keep theirs. 0 = never.
+    int idleTrimSeconds = 10;
     int requestTimeoutSeconds = 120;
     // A client has this long, from its first byte (or from accept), to
     // finish the request line and headers; the rest of the request is
@@ -239,6 +244,7 @@ private:
     friend class Session;
 
     void runLoop(size_t index);
+    void scheduleIdleSweep(size_t index);
     void handleAccept(size_t index, socket_t fd, bool tls = false);
     void releaseSession(size_t index, Session& session, size_t retainedBefore,
                         size_t retainedAfter);

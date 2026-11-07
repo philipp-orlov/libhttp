@@ -9,6 +9,7 @@
 // churn the heap.
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -37,14 +38,31 @@ public:
     // Bytes not yet taken by the socket, over every queued frame.
     size_t pendingBytes() const { return pendingBytes_; }
 
-    // The ring is sized on first use and never resized: `capacity` is the
-    // server's frame limit, so a push beyond it is refused by the caller.
-    void reserve(size_t capacity)
+    // Room for one more frame, growing the ring as needed up to `limit`
+    // frames, the server's frame limit. False: the queue is at the limit.
+    // Grown rather than sized to the limit at once, which would cost every
+    // connection that ever queues a frame the whole limit's worth of slots.
+    bool makeRoom(size_t limit)
     {
-        if (slots_.empty())
-            slots_.resize(capacity ? capacity : 1);
+        if (count_ < slots_.size())
+            return true;
+        if (count_ >= limit)
+            return false;
+        std::vector<OutFrame> grown(std::min(std::max<size_t>(8, slots_.size() * 2), limit));
+        for (size_t i = 0; i < count_; ++i)
+            grown[i] = std::move(slots_[(head_ + i) % slots_.size()]);
+        slots_.swap(grown);
+        head_ = 0;
+        return true;
     }
-    bool full() const { return count_ == slots_.size(); }
+    // Gives the ring's storage back; only when empty.
+    void release()
+    {
+        if (count_ == 0) {
+            std::vector<OutFrame>().swap(slots_);
+            head_ = 0;
+        }
+    }
 
     void push(OutFrame&& frame)
     {

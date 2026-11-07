@@ -320,6 +320,38 @@ public:
     bool attached() const { return connection_ != nullptr; }
     void shutdown() { closeAndCleanup(); }
 
+    // From the loop's idle sweep (ServerConfig::idleTrimSeconds): a WebSocket
+    // connection that has carried nothing since the last sweep, with nothing
+    // half read or half written, gives back every buffer it holds and what the
+    // upgrade request left behind. A connection that is busy keeps them, so
+    // its steady state still allocates nothing.
+    void trimIfIdle()
+    {
+        if (!isWebSocket_ || closing_ || !connection_)
+            return;
+        if (active_) {
+            active_ = false;
+            return;
+        }
+        if (trimmed_ || writeInFlight_ || !writeData_.empty() || !outFrames_.empty() ||
+            !readBuffer_.empty() || webSocketHasPendingMessage_)
+            return;
+        std::string().swap(writeData_);
+        std::string().swap(pendingWrite_);
+        std::string().swap(largeBody_);
+        std::string().swap(webSocketPendingMessage_);
+        std::string().swap(response_.body);
+        std::string().swap(request_.head);
+        std::string().swap(request_.decodedPath);
+        readBuffer_ = Buffer(server_.buffers_);  // a pending read lands in the loop's buffer
+        request_.body = Buffer(server_.buffers_);
+        response_.headers.trimSpare(0);
+        context_.trimSpare(0);
+        decltype(routeParams_)().swap(routeParams_);
+        outFrames_.release();
+        trimmed_ = true;
+    }
+
 private:
     // What to do once every corked byte has been written.
     enum class AfterFlush
@@ -1374,8 +1406,7 @@ private:
             }
             out.sent = sent;
         }
-        outFrames_.reserve(server_.config().maxWebSocketQueuedFrames);
-        if (outFrames_.full()) {
+        if (!outFrames_.makeRoom(server_.config().maxWebSocketQueuedFrames)) {
             closeAndCleanup();
             return;
         }
@@ -1409,8 +1440,7 @@ private:
         if (!outFrames_.empty()) {
             // Frames sent as pooled blocks are still waiting: this one goes
             // behind them, as a copy in a block of its own.
-            outFrames_.reserve(server_.config().maxWebSocketQueuedFrames);
-            if (outFrames_.full()) {
+            if (!outFrames_.makeRoom(server_.config().maxWebSocketQueuedFrames)) {
                 closeAndCleanup();
                 return;
             }
@@ -1594,6 +1624,8 @@ private:
 
     void resetTimeout()
     {
+        active_ = true;
+        trimmed_ = false;
         // The round's cached clock is plenty: the timer has a second of slack.
         const auto now = loop_.now();
         auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1784,6 +1816,9 @@ private:
     bool handlerPending_ = false;  // a handler returned without answering and has not called done
     bool zombie_ = false;          // connection closed, Session kept for the pending handler
     uint64_t zombieTimerId_ = 0;
+
+    bool active_ = false;   // traffic since the last idle sweep (resetTimeout)
+    bool trimmed_ = false;  // trimIfIdle() has run and nothing has happened since
 
     bool isWebSocket_ = false;
     std::shared_ptr<WebSocketConnection> webSocketConnection_;
@@ -2018,6 +2053,23 @@ void Server::handleAccept(size_t index, socket_t fd, bool tls)
     }
 }
 
+void Server::scheduleIdleSweep(size_t index)
+{
+    if (config_.idleTrimSeconds <= 0)
+        return;
+    try {
+        loops_[index]->addTimer(std::chrono::seconds(config_.idleTrimSeconds), [this, index] {
+            for (const auto& session : sessionPools_[index]->all)
+                session->trimIfIdle();
+            scheduleIdleSweep(index);
+        });
+    } catch (const std::exception&) {
+        // Cannot happen once running: a timer's slot is free again before its
+        // callback runs, and this re-arms from there.
+        HTTP_LOG_WARN("idle sweep not scheduled: no timer slot");
+    }
+}
+
 void Server::runLoop(size_t index)
 {
     loops_[index]->run();
@@ -2040,6 +2092,7 @@ void Server::run(std::function<bool()> shouldStop, std::function<void()> onListe
                 std::make_unique<IoLoop>(config_.reactorTaskCapacity, config_.reactorTimerCapacity);
             sessionPools_[i] = std::make_unique<internal::SessionPool>();
             sessionPools_[i]->capacity = config_.maxConnectionsPerLoop;
+            scheduleIdleSweep(i);
             if (config_.httpEnabled) {
                 listeners_[i] = std::make_unique<TcpListener>(*loops_[i], config_.host,
                                                               config_.port, config_.reusePort);

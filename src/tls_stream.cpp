@@ -11,6 +11,40 @@
 
 namespace http::internal {
 namespace {
+constexpr size_t kPlaintextBytes = 16384;
+// What outgoing_ keeps once a connection has nothing left to send.
+constexpr size_t kRetainedOutgoingBytes = 4096;
+
+// Decrypted bytes handed to a read callback that gave no buffer. One per
+// thread serves every stream of its loop, since each callback consumes its
+// bytes before returning; `busy` covers the one case where it would not: a
+// callback whose own work pumps another stream of the same loop.
+struct SharedPlaintext
+{
+    unsigned char bytes[kPlaintextBytes];
+    bool busy = false;
+};
+thread_local SharedPlaintext t_plaintext;
+
+struct PlaintextUse
+{
+    explicit PlaintextUse(bool active) : active_(active)
+    {
+        if (active_)
+            t_plaintext.busy = true;
+    }
+    ~PlaintextUse()
+    {
+        if (active_)
+            t_plaintext.busy = false;
+    }
+    PlaintextUse(const PlaintextUse&) = delete;
+    PlaintextUse& operator=(const PlaintextUse&) = delete;
+
+private:
+    bool active_;
+};
+
 int noPassword(char*, int, int, void*)
 {
     return 0;
@@ -44,6 +78,9 @@ TlsContext makeTlsContext(const std::string& certificate, const std::string& pri
         throw std::runtime_error("invalid TLS certificate or private key configuration");
 
     SSL_CTX_set_options(context.get(), SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
+    // The SSL's own record buffers (about 34 KiB together) go back to the heap
+    // whenever they are empty, so an idle connection does not keep them.
+    SSL_CTX_set_mode(context.get(), SSL_MODE_RELEASE_BUFFERS);
     SSL_CTX_set_alpn_select_cb(context.get(), selectProtocol, nullptr);
     return context;
 }
@@ -81,12 +118,12 @@ void TlsStream::asyncRead(unsigned char* buffer, size_t capacity, IoCallback cal
         callback({0, false, 0});
         return;
     }
-    if (!buffer) {
-        buffer = plaintext_.data();
-        capacity = plaintext_.size();
-    }
-    if (readCallback_ || !capacity)
+    if (readCallback_ || (buffer && !capacity))
         throw std::logic_error("invalid concurrent TLS read");
+
+    readShared_ = !buffer;
+    if (readShared_)
+        capacity = kPlaintextBytes;
 
     readBuffer_ = buffer;
     readCapacity_ = capacity;
@@ -152,6 +189,9 @@ bool TlsStream::flush()
             return;
         }
         self->pump();
+        // Idle again: a burst's worth of buffer goes back.
+        if (!self->sending_ && !self->writeCallback_ && self->outgoing_.capacity() > kRetainedOutgoingBytes)
+            std::vector<unsigned char>().swap(self->outgoing_);
     });
     return !sending_ && !closed_;
 }
@@ -163,13 +203,15 @@ void TlsStream::receive()
 
     receiving_ = true;
     auto self = shared_from_this();
-    connection_->asyncRead(incoming_.data(), incoming_.size(), [self](IoResult result) {
+    connection_->asyncRead(nullptr, 0, [self](IoResult result) {
         self->receiving_ = false;
         if (self->closed_)
             return;
 
+        // Copied into the BIO before anything else can run: the loop's buffer
+        // is ours only until this callback returns.
         if (!result.ok || !result.bytes ||
-            BIO_write(SSL_get_rbio(self->ssl_.get()), self->incoming_.data(),
+            BIO_write(SSL_get_rbio(self->ssl_.get()), result.data,
                       static_cast<int>(result.bytes)) != static_cast<int>(result.bytes)) {
             self->fail();
             return;
@@ -218,11 +260,24 @@ void TlsStream::pump()
                     continue;
                 }
             } else if (readCallback_) {
-                result = SSL_read(ssl_.get(), readBuffer_,
-                                  static_cast<int>(std::min(readCapacity_, size_t{16384})));
+                unsigned char* target = readBuffer_;
+                const bool shared = readShared_ && !t_plaintext.busy;
+                if (shared) {
+                    target = t_plaintext.bytes;
+                    fallback_.reset();  // a nested read's, no longer needed
+                } else if (readShared_) {
+                    if (!fallback_)
+                        fallback_.reset(new unsigned char[kPlaintextBytes]);
+                    target = fallback_.get();
+                }
+                result = SSL_read(ssl_.get(), target,
+                                  static_cast<int>(std::min(readCapacity_, kPlaintextBytes)));
                 if (result > 0) {
                     auto callback = std::move(readCallback_);
-                    callback({static_cast<size_t>(result), true, 0, readBuffer_});
+                    {
+                        PlaintextUse use(shared);
+                        callback({static_cast<size_t>(result), true, 0, target});
+                    }
                     continue;
                 }
             } else {

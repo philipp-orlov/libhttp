@@ -202,6 +202,11 @@ if(HTTP_BUILD_TESTS AND BUILD_TESTING)
     target_link_libraries(http_test_websocket PRIVATE http)
     add_test(NAME http_websocket COMMAND http_test_websocket)
 
+    add_executable(http_test_websocket_idle tests/test_websocket_idle.cpp)
+    target_link_libraries(http_test_websocket_idle PRIVATE http)
+    add_test(NAME http_websocket_idle COMMAND http_test_websocket_idle)
+    set_tests_properties(http_websocket_idle PROPERTIES TIMEOUT 60)
+
     add_executable(http_test_json tests/test_json.cpp)
     target_link_libraries(http_test_json PRIVATE http)
     add_test(NAME http_json COMMAND http_test_json)
