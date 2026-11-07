@@ -15,6 +15,7 @@
 
 #include "http/io_loop.hpp"
 #include "http/memory_pool.hpp"
+#include "http/raw_connection.hpp"
 #include "http/route_pattern.hpp"
 #include "http/router.hpp"
 #include "http/static_files.hpp"
@@ -189,6 +190,11 @@ public:
     Server& onWebSocket(std::string pattern, WebSocketHandler handler, WebSocketRouteOptions options);
     // GET only: a long-lived, server-push response (see streaming_connection.hpp).
     Server& onStream(std::string pattern, StreamHandler handler);
+    // Takes over connections whose request head `match` claims, from the first byte of that request: the handler reads
+    // and writes the raw byte stream (see RawConnection). Checked in order of registration, before any other route and
+    // before the allowedHosts check, at the start of each request on a connection. While any raw route exists, a request
+    // is parsed only once its whole head has arrived. Register before run().
+    Server& onRaw(RawMatch match, RawHandler handler, RawRouteOptions options = {});
 
     // Replaces the built-in `404 Not Found` body for a path no route and no
     // static handler claimed. Useful when routes are registered from data
@@ -267,6 +273,13 @@ private:
     };
     RouteTable<WebSocketRoute> webSocketRoutes_;
     RouteTable<StreamHandler> streamRoutes_;
+    struct RawRoute
+    {
+        RawMatch match;
+        RawHandler handler;
+        RawRouteOptions options;
+    };
+    std::vector<RawRoute> rawRoutes_;
 
     mutable std::mutex poolMutex_;
     std::unique_ptr<ThreadPool> pool_;

@@ -301,6 +301,14 @@ public:
         webSocketPendingOpcode_ = WsOpcode::Text;
         webSocketHasPendingMessage_ = false;
 
+        requestFresh_ = true;
+        isRaw_ = false;
+        rawConnection_.reset();
+        rawPaused_ = false;
+        rawEof_ = false;
+        rawCloseAfterFlush_ = false;
+        rawInWrite_ = false;
+
         isStreaming_ = false;
         streamConnection_.reset();
         streamWriteInFlight_ = false;
@@ -314,6 +322,111 @@ public:
         headerDeadline_ = std::chrono::steady_clock::now() +
                           std::chrono::seconds(server_.config().headerReadTimeoutSeconds);
         resetTimeout();
+        readMore();
+    }
+
+    // A raw route claimed the request starting at `bytes` (its head is `head`): the connection is the handler's from here.
+    void takeOver(const Server::RawRoute& route, std::string_view head, std::string_view bytes)
+    {
+        isRaw_ = true;
+        requestStarted_ = false;
+        headerPhase_ = false;
+        webSocketIdleSeconds_ = route.options.idleTimeoutSeconds > 0 ? route.options.idleTimeoutSeconds
+                                                                       : server_.config().keepAliveTimeoutSeconds;
+        rawConnection_ = std::make_shared<RawConnection>();
+        const uint64_t generation = connectionGeneration_;
+        IoLoop* loop = &loop_;
+        rawConnection_->bind(
+            [this, generation](std::string_view data) {
+                if (connectionGeneration_ != generation || closing_ || rawCloseAfterFlush_)
+                    return false;
+                writeData_.append(data.data(), data.size());
+                if (!processing_) {
+                    // A write the socket takes at once completes inside flush(); onDrained must not run inside the
+                    // caller's own write() (see onWriteComplete).
+                    rawInWrite_ = true;
+                    flush();
+                    rawInWrite_ = false;
+                }
+                return true;
+            },
+            [this, generation]() -> size_t {
+                if (connectionGeneration_ != generation || closing_)
+                    return 0;
+                return writeData_.size() + (writeInFlight_ ? pendingWrite_.size() : 0);
+            },
+            [this, generation](bool pause) {
+                if (connectionGeneration_ != generation || closing_)
+                    return;
+                rawPaused_ = pause;
+                if (!pause && !reading_ && !processing_)
+                    readMore();
+            },
+            [this, generation](bool now) {
+                if (connectionGeneration_ != generation || closing_)
+                    return;
+                if (now || (!writeInFlight_ && writeData_.empty())) {
+                    closeAndCleanup();
+                    return;
+                }
+                rawCloseAfterFlush_ = true;
+            },
+            [loop](std::function<void()> task) { return loop->tryPost(std::move(task)); }, peerAddress_);
+        resetTimeout();
+        // Bytes of `bytes` live in the loop's buffer or readBuffer_: both are ours until this returns, and the handler
+        // sees them before anything else can happen.
+        processing_ = true;
+        try {
+            route.handler(head, rawConnection_);
+            if (!closing_ && rawConnection_ && rawConnection_->dataCallback())
+                rawConnection_->dataCallback()(bytes);
+        } catch (...) {
+            processing_ = false;
+            closeAndCleanup();
+            return;
+        }
+        processing_ = false;
+        if (closing_)
+            return;
+        readBuffer_.clear();
+        flush();
+        readMore();
+    }
+
+    void onRawRead(const IoResult& result)
+    {
+        if (!result.ok) {
+            closeAndCleanup();
+            return;
+        }
+        resetTimeout();
+        if (result.bytes == 0) {
+            rawEof_ = true;
+            if (rawConnection_ && rawConnection_->eofCallback()) {
+                try {
+                    rawConnection_->eofCallback()();
+                } catch (...) {
+                    closeAndCleanup();
+                }
+            } else {
+                closeAndCleanup();
+            }
+            return;
+        }
+        processing_ = true;
+        try {
+            if (rawConnection_ && rawConnection_->dataCallback())
+                rawConnection_->dataCallback()(
+                    std::string_view(reinterpret_cast<const char*>(result.data), result.bytes));
+        } catch (...) {
+            processing_ = false;
+            closeAndCleanup();
+            return;
+        }
+        processing_ = false;
+        if (closing_)
+            return;
+        flush();
         readMore();
     }
 
@@ -385,7 +498,13 @@ private:
         if (reading_)
             return;
 
+        if (isRaw_ && (rawPaused_ || rawEof_))
+            return;
         reading_ = true;
+        if (isRaw_) {
+            connection_->asyncRead(nullptr, 0, [this](IoResult result) { onReadComplete(result, ReadTarget::LoopBuffer); });
+            return;
+        }
         if (isWebSocket_) {
             if (!readBuffer_.empty()) {
                 const size_t want =
@@ -419,6 +538,10 @@ private:
         if (closing_)
             return;
 
+        if (isRaw_) {
+            onRawRead(result);
+            return;
+        }
         if (!result.ok || result.bytes == 0) {
             closeAndCleanup();
             return;
@@ -491,6 +614,30 @@ private:
                 processing_ = false;
                 return;
             }
+            if (requestFresh_ && !server_.rawRoutes_.empty()) {
+                const std::string_view rest = input.substr(offset);
+                const size_t end = rest.find("\r\n\r\n");
+                if (end == std::string_view::npos && rest.size() <= server_.config().maxHeaderBytes) {
+                    // The whole head first: a raw route decides on it, and takes the bytes as they came.
+                    keepUnconsumed(input, offset);
+                    processing_ = false;
+                    flush();
+                    if (!closing_)
+                        readMore();
+                    return;
+                }
+                if (end != std::string_view::npos) {
+                    const std::string_view head = rest.substr(0, end + 4);
+                    for (const auto& route : server_.rawRoutes_) {
+                        if (route.match(head)) {
+                            processing_ = false;
+                            takeOver(route, head, rest);
+                            return;
+                        }
+                    }
+                }
+                requestFresh_ = false;  // the parser has it now; at the next request a route may look again
+            }
             size_t consumed = 0;
             std::string error;
             const ParseStatus status = parser_.parse(input.substr(offset), consumed, request_, error);
@@ -530,6 +677,7 @@ private:
                 return;
             }
             parser_.reset();
+            requestFresh_ = true;
             dispatchRequest();
             // A handler that answers later, an upgrade, a stream, a body
             // written uncorked, or a close: nothing further is parsed for now.
@@ -907,6 +1055,28 @@ private:
         webSocketInFlightFrames_ = 0;
         if (!writeData_.empty() || !outFrames_.empty()) {
             flush();
+            return;
+        }
+        if (isRaw_) {
+            if (rawCloseAfterFlush_) {
+                closeAndCleanup();
+                return;
+            }
+            if (rawInWrite_ || processing_) {
+                // Inside the handler's own write() or data callback: it hears once that call has returned.
+                if (!rawDrainPosted_) {
+                    const uint64_t generation = connectionGeneration_;
+                    rawDrainPosted_ = loop_.tryPost([this, generation] {
+                        rawDrainPosted_ = false;
+                        if (connectionGeneration_ == generation && !closing_ && isRaw_ && !writeInFlight_ &&
+                            writeData_.empty() && rawConnection_ && rawConnection_->drainedCallback())
+                            rawConnection_->drainedCallback()();
+                    });
+                }
+                return;
+            }
+            if (rawConnection_ && rawConnection_->drainedCallback())
+                rawConnection_->drainedCallback()();
             return;
         }
         if (isWebSocket_) {
@@ -1629,10 +1799,10 @@ private:
         // The round's cached clock is plenty: the timer has a second of slack.
         const auto now = loop_.now();
         auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::seconds(isWebSocket_ && webSocketIdleSeconds_ > 0
+            std::chrono::seconds((isWebSocket_ || isRaw_) && webSocketIdleSeconds_ > 0
                                      ? webSocketIdleSeconds_
                                      : server_.config().keepAliveTimeoutSeconds));
-        if (!isWebSocket_ && !isStreaming_ && (requestStarted_ || !served_)) {
+        if (!isWebSocket_ && !isStreaming_ && !isRaw_ && (requestStarted_ || !served_)) {
             delay = std::min(delay, std::chrono::duration_cast<std::chrono::milliseconds>(
                                         requestDeadline_ - now));
             if (headerPhase_ && server_.config().headerReadTimeoutSeconds > 0)
@@ -1683,6 +1853,13 @@ private:
                 streamConnection_->closeCallback()();
             } catch (...) {}
         }
+        if (rawConnection_ && rawConnection_->closeCallback()) {
+            try {
+                rawConnection_->closeCallback()();
+            } catch (...) {}
+        }
+        if (rawConnection_)
+            rawConnection_->releaseCallbacks();
         if (webSocketConnection_)
             webSocketConnection_->releaseCallbacks();
 
@@ -1697,6 +1874,7 @@ private:
         server_.connectionClosed(loopIndex_, peerIp_);
         webSocketConnection_.reset();
         streamConnection_.reset();
+        rawConnection_.reset();
         if (handlerPending_) {
             // A handler still holds the request, its body and the context:
             // the Session stays out of the pool until it calls `done`, however
@@ -1834,6 +2012,15 @@ private:
     WsOpcode webSocketPendingOpcode_ = WsOpcode::Text;
     bool webSocketHasPendingMessage_ = false;
 
+    bool requestFresh_ = true;  // nothing of the next request is parsed yet: a raw route may still claim it
+    bool isRaw_ = false;
+    std::shared_ptr<RawConnection> rawConnection_;
+    bool rawPaused_ = false;
+    bool rawEof_ = false;
+    bool rawCloseAfterFlush_ = false;
+    bool rawInWrite_ = false;
+    bool rawDrainPosted_ = false;
+
     bool isStreaming_ = false;
     std::shared_ptr<StreamingConnection> streamConnection_;
     bool streamWriteInFlight_ = false;
@@ -1929,6 +2116,41 @@ Server& Server::onWebSocket(std::string pattern, WebSocketHandler handler, WebSo
     webSocketRoutes_.add(HttpMethod::Get, std::move(pattern),
                          WebSocketRoute{std::move(handler), std::move(options)});
     return *this;
+}
+
+Server& Server::onRaw(RawMatch match, RawHandler handler, RawRouteOptions options)
+{
+    rawRoutes_.push_back({std::move(match), std::move(handler), options});
+    return *this;
+}
+
+std::string_view rawHeader(std::string_view head, std::string_view name)
+{
+    size_t line = head.find("\r\n");
+    while (line != std::string_view::npos && line + 2 < head.size()) {
+        const size_t start = line + 2;
+        const size_t end = head.find("\r\n", start);
+        if (end == std::string_view::npos || end == start)
+            break;
+        const std::string_view field = head.substr(start, end - start);
+        const size_t colon = field.find(':');
+        if (colon == name.size()) {
+            bool same = true;
+            for (size_t i = 0; i < colon && same; ++i)
+                same = std::tolower(static_cast<unsigned char>(field[i])) ==
+                       std::tolower(static_cast<unsigned char>(name[i]));
+            if (same) {
+                std::string_view value = field.substr(colon + 1);
+                while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                    value.remove_prefix(1);
+                while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+                    value.remove_suffix(1);
+                return value;
+            }
+        }
+        line = end;
+    }
+    return {};
 }
 
 Server& Server::onStream(std::string pattern, StreamHandler handler)
