@@ -234,7 +234,9 @@ WebSocketUrl parseWebSocketUrl(std::string_view url)
 #if defined(HTTP_WS_CLIENT_TLS) && defined(HTTP_WINDOWS)
 // Windows raises no SIGPIPE.
 struct NoSigpipe
-{};
+{
+    NoSigpipe() {}  // a scope object, as on POSIX; user-provided so that it is not an unreferenced variable
+};
 #elif defined(HTTP_WS_CLIENT_TLS)
 // Holds SIGPIPE back on this thread for a scope; one raised by the writes inside is swallowed.
 struct NoSigpipe
