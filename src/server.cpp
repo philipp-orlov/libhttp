@@ -1858,13 +1858,26 @@ private:
                 rawConnection_->closeCallback()();
             } catch (...) {}
         }
-        if (rawConnection_)
-            rawConnection_->releaseCallbacks();
-        if (webSocketConnection_)
-            webSocketConnection_->releaseCallbacks();
-
-        if (streamConnection_)
-            streamConnection_->releaseCallbacks();
+        // The callbacks may be on the stack: a handler that sends from inside onMessage can close this
+        // connection (a full queue), and dropping the std::function that is running would free the
+        // handler's own captures under it. Release them from a task of the loop, once the handler returned.
+        {
+            auto raw = std::move(rawConnection_);
+            auto socket = std::move(webSocketConnection_);
+            auto stream = std::move(streamConnection_);
+            if (raw || socket || stream) {
+                auto release = [raw, socket, stream] {
+                    if (raw)
+                        raw->releaseCallbacks();
+                    if (socket)
+                        socket->releaseCallbacks();
+                    if (stream)
+                        stream->releaseCallbacks();
+                };
+                if (!loop_.tryPost(release))
+                    release();  // the loop is gone: no handler can be running
+            }
+        }
 
         if (!connection_)
             return;

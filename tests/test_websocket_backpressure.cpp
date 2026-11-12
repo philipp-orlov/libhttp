@@ -95,11 +95,12 @@ void runServer(bool dropOldest)
     config.dropOldestWebSocketFrames = dropOldest;
     config.validateOutgoingWebSocketText = !dropOldest;
     http::Server server(config);
-    // Kept here: a send that closes the connection must not free the handle
-    // whose callback is still running.
+    // Where the connection stays open its handle is kept here. Where a send closes it (the default
+    // run) it is not: the server must itself keep the handler alive until the handler returns.
     static std::vector<std::shared_ptr<http::WebSocketConnection>> sockets;
-    server.onWebSocket("/ws", [](std::shared_ptr<http::WebSocketConnection> connection) {
-        sockets.push_back(connection);
+    server.onWebSocket("/ws", [dropOldest](std::shared_ptr<http::WebSocketConnection> connection) {
+        if (dropOldest)
+            sockets.push_back(connection);
         http::WebSocketConnection* raw = connection.get();
         connection->onMessage([raw](std::string_view data, bool) {
             if (data == "flood") {
