@@ -1874,8 +1874,16 @@ private:
                     if (stream)
                         stream->releaseCallbacks();
                 };
-                if (!loop_.tryPost(release))
-                    release();  // the loop is gone: no handler can be running
+                // tryPost also fails when the bounded task queue is merely full, which is when a handler
+                // is most likely still on the stack. The reserved control lane survives a full queue and
+                // throws only once the loop is stopped; only then can no handler be running.
+                if (!loop_.tryPost(release)) {
+                    try {
+                        loop_.postControl(release);
+                    } catch (...) {
+                        release();
+                    }
+                }
             }
         }
 

@@ -92,6 +92,12 @@ void runServer(bool dropOldest)
     config.ioThreads = 1;
     config.workerThreads = 1;
     config.maxWebSocketQueuedFrames = 4;
+    if (!dropOldest) {
+        // A tiny task queue, filled by the handler below: the close must not release the running
+        // handler's callbacks inline just because the loop's queue has no room.
+        config.reactorTaskCapacity = 8;
+        config.workerQueueCapacity = 2;
+    }
     config.dropOldestWebSocketFrames = dropOldest;
     config.validateOutgoingWebSocketText = !dropOldest;
     http::Server server(config);
@@ -102,8 +108,11 @@ void runServer(bool dropOldest)
         if (dropOldest)
             sockets.push_back(connection);
         http::WebSocketConnection* raw = connection.get();
-        connection->onMessage([raw](std::string_view data, bool) {
+        connection->onMessage([raw, dropOldest](std::string_view data, bool) {
             if (data == "flood") {
+                if (!dropOldest)
+                    while (raw->post([] {})) {
+                    }
                 // Corked while the message is handled: more than the queue takes.
                 for (int index = 0; index < 200; ++index) {
                     std::string frame = "frame " + std::to_string(index) + " ";
