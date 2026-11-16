@@ -135,7 +135,10 @@ std::string urlDecode(std::string_view in, bool plusAsSpace)
 void urlDecode(std::string_view in, bool plusAsSpace, std::string& out)
 {
     out.clear();
-    out.reserve(in.size());
+    // Only ever to grow: before C++20 (libstdc++ up to GCC 10) reserve() below the capacity is a request to shrink,
+    // which frees the block a reused string kept from the last request.
+    if (out.capacity() < in.size())
+        out.reserve(in.size());
     for (size_t i = 0; i < in.size(); ++i) {
         char c = in[i];
         if (c == '%' && i + 2 < in.size()) {

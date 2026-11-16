@@ -2296,6 +2296,19 @@ void Server::handleAccept(size_t index, socket_t fd, bool tls)
     }
 }
 
+void Server::dealAccept(socket_t fd, bool tls)
+{
+    const size_t target = nextAcceptLoop_++ % loops_.size();
+    if (target == 0) {
+        handleAccept(0, fd, tls);
+        return;
+    }
+    // The socket belongs to no loop yet: the connection made on the target loop registers it there. A loop whose
+    // task queue is full is skipped rather than the connection dropped.
+    if (!loops_[target]->tryPost([this, target, fd, tls] { handleAccept(target, fd, tls); }))
+        handleAccept(0, fd, tls);
+}
+
 void Server::scheduleIdleSweep(size_t index)
 {
     if (config_.idleTrimSeconds <= 0)
@@ -2329,6 +2342,16 @@ void Server::run(std::function<bool()> shouldStop, std::function<void()> onListe
     listeners_.resize(config_.ioThreads);
     tlsListeners_.resize(config_.ioThreads);
     sessionPools_.resize(config_.ioThreads);
+    // Every loop listens for itself where the kernel deals the connections of a shared port to its listeners
+    // (SO_REUSEPORT). Elsewhere -- Windows has no such thing: sockets sharing a port there do not share its
+    // connections -- loop 0 has the one listener, and deals what it accepts to the loops in turn.
+#ifdef _WIN32
+    const bool perLoopListeners = config_.ioThreads == 1;
+    const bool sharePort = false;  // an exclusive bind: a port that is taken is an error, not a silent second owner
+#else
+    const bool perLoopListeners = config_.reusePort || config_.ioThreads == 1;
+    const bool sharePort = perLoopListeners && config_.reusePort;
+#endif
     try {
         for (size_t i = 0; i < config_.ioThreads; ++i) {
             loops_[i] =
@@ -2336,16 +2359,23 @@ void Server::run(std::function<bool()> shouldStop, std::function<void()> onListe
             sessionPools_[i] = std::make_unique<internal::SessionPool>();
             sessionPools_[i]->capacity = config_.maxConnectionsPerLoop;
             scheduleIdleSweep(i);
+            if (!perLoopListeners && i != 0)
+                continue;
             if (config_.httpEnabled) {
-                listeners_[i] = std::make_unique<TcpListener>(*loops_[i], config_.host,
-                                                              config_.port, config_.reusePort);
-                listeners_[i]->asyncAccept([this, i](socket_t fd) { handleAccept(i, fd); });
+                listeners_[i] =
+                    std::make_unique<TcpListener>(*loops_[i], config_.host, config_.port, sharePort);
+                if (perLoopListeners)
+                    listeners_[i]->asyncAccept([this, i](socket_t fd) { handleAccept(i, fd); });
+                else
+                    listeners_[i]->asyncAccept([this](socket_t fd) { dealAccept(fd, false); });
             }
             if (config_.tls) {
-                tlsListeners_[i] = std::make_unique<TcpListener>(
-                    *loops_[i], config_.host, config_.tls->port, config_.reusePort);
-                tlsListeners_[i]->asyncAccept(
-                    [this, i](socket_t fd) { handleAccept(i, fd, true); });
+                tlsListeners_[i] =
+                    std::make_unique<TcpListener>(*loops_[i], config_.host, config_.tls->port, sharePort);
+                if (perLoopListeners)
+                    tlsListeners_[i]->asyncAccept([this, i](socket_t fd) { handleAccept(i, fd, true); });
+                else
+                    tlsListeners_[i]->asyncAccept([this](socket_t fd) { dealAccept(fd, true); });
             }
         }
     } catch (...) {

@@ -209,6 +209,19 @@ if(HTTP_BUILD_TESTS AND BUILD_TESTING)
     target_link_libraries(http_test_websocket PRIVATE http)
     add_test(NAME http_websocket COMMAND http_test_websocket)
 
+    # Socket-level, on every platform (the others below are POSIX).
+    add_executable(http_test_portable_server tests/test_portable_server.cpp)
+    target_link_libraries(http_test_portable_server PRIVATE http)
+    add_test(NAME http_portable_server COMMAND http_test_portable_server)
+    set_tests_properties(http_portable_server PROPERTIES TIMEOUT 120)
+
+    # A memory soak over real sockets; run by hand (http_soak_portable [seconds] [clients]).
+    add_executable(http_soak_portable tests/soak_portable.cpp)
+    target_link_libraries(http_soak_portable PRIVATE http)
+    if(WIN32)
+        target_link_libraries(http_soak_portable PRIVATE psapi)
+    endif()
+
     add_executable(http_test_raw_routes tests/test_raw_routes.cpp)
     target_link_libraries(http_test_raw_routes PRIVATE http)
     add_test(NAME http_raw_routes COMMAND http_test_raw_routes)

@@ -29,9 +29,11 @@ std::pair<std::string, std::string>& addEntry(
 void retireEntries(std::vector<std::pair<std::string, std::string>>& items,
                    std::vector<std::pair<std::string, std::string>>& spare)
 {
-    for (auto& item : items) {
+    // Last first: addEntry takes from the back, so the next request's first entry is this one's first again, and a
+    // value that needed a heap block finds it in the same place (the same route sends the same parameters).
+    for (auto item = items.rbegin(); item != items.rend(); ++item) {
         if (spare.size() < kMaxSpare)
-            spare.push_back(std::move(item));
+            spare.push_back(std::move(*item));
     }
     items.clear();
 }

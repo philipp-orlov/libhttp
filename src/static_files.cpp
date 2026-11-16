@@ -372,6 +372,23 @@ bool StaticFileHandler::tryHandle(HttpContext& context) const
         context.status(403).text("Forbidden");
         return true;
     }
+    // Windows has more than one spelling for a file: an alternate data stream ("a.txt::$DATA"), trailing dots and
+    // spaces ("a.txt."), and the short name of a long one ("GIT~1" for ".git"). The rules above looked at the
+    // spelling that was asked for; they must hold for the file that would be served, so they are applied again to
+    // its real name. A spelling with a colon names a stream and is never served.
+    if (relative.find(':') != std::string::npos)
+        return false;
+    {
+        const std::string real = canonicalFile.lexically_relative(canonicalRoot).generic_string();
+        if (!options_.allowDotfiles && hasDotComponent(real))
+            return false;
+        if (!options_.extensionAllowlist.empty()) {
+            const std::string extension = lowerExtension(real);
+            if (std::find(options_.extensionAllowlist.begin(), options_.extensionAllowlist.end(), extension) ==
+                options_.extensionAllowlist.end())
+                return false;
+        }
+    }
 
     // No such file: decline, so the server's 404 (or onNotFound handler)
     // answers. A root-mounted static handler must not swallow every unmatched
@@ -380,6 +397,8 @@ bool StaticFileHandler::tryHandle(HttpContext& context) const
         return false;
 
     auto fileSize = fs::file_size(canonicalFile, ec);
+    if (ec)
+        return false;  // gone between the two looks
     auto mtime = fs::last_write_time(canonicalFile, ec);
     std::string etag = makeEtag(static_cast<uint64_t>(fileSize),
                                 static_cast<int64_t>(mtime.time_since_epoch().count()), 0);

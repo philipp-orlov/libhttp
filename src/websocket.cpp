@@ -3,6 +3,7 @@
 
 #include "http/websocket.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -157,7 +158,10 @@ void appendFrame(WsOpcode opcode, std::string_view payload, bool fin, std::strin
 {
     char header[10];
     const size_t headerSize = encodeFrameHeader(opcode, payload.size(), fin, header);
-    out.reserve(out.size() + headerSize + payload.size());
+    // Only ever to grow: before C++20 (libstdc++ up to GCC 10) reserve() below the capacity reallocates the string to
+    // exactly that size, which here would be a copy of the whole corked output for every frame.
+    if (out.capacity() - out.size() < headerSize + payload.size())
+        out.reserve(std::max(out.size() + headerSize + payload.size(), out.capacity() * 2));
     out.append(header, headerSize);
     out.append(payload.data(), payload.size());
 }

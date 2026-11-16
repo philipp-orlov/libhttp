@@ -252,6 +252,8 @@ private:
     void runLoop(size_t index);
     void scheduleIdleSweep(size_t index);
     void handleAccept(size_t index, socket_t fd, bool tls = false);
+    // With one listener for every loop (see run): hands the connection to the next loop in turn. Loop 0 only.
+    void dealAccept(socket_t fd, bool tls);
     void releaseSession(size_t index, Session& session, size_t retainedBefore,
                         size_t retainedAfter);
     void connectionClosed(size_t index, const std::string& peerIp);
@@ -296,6 +298,7 @@ private:
     std::mutex stopMutex_;
     std::condition_variable stopCv_;
     size_t closedListeners_ = 0;
+    size_t nextAcceptLoop_ = 0;  // loop 0 only
     std::atomic<bool> running_{false};
 };
 

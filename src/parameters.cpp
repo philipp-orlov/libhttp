@@ -18,8 +18,8 @@
 #endif
 #endif
 
-#if !HTTP_FP_CHARCONV && !defined(_WIN32)
-#include <locale.h>
+#if !HTTP_FP_CHARCONV
+#include "base/classic_locale.hpp"
 #endif
 
 namespace http {
@@ -52,10 +52,8 @@ bool parseFloating(std::string_view text, Value& value)
     }
     std::memcpy(token, text.data(), text.size());
     token[text.size()] = '\0';
-#ifndef _WIN32
-    static const locale_t classic = newlocale(LC_ALL_MASK, "C", static_cast<locale_t>(0));
-    const locale_t previous = classic ? uselocale(classic) : static_cast<locale_t>(0);
-#endif
+    // strtod takes its decimal point from LC_NUMERIC: the "C" locale for this scope, on every platform.
+    base::ClassicLocale classic;
     char* end = nullptr;
     errno = 0;
     if constexpr (std::is_same_v<Value, float>)
@@ -67,10 +65,6 @@ bool parseFloating(std::string_view text, Value& value)
     // ERANGE also flags a subnormal result, which from_chars accepts; only an
     // underflow to zero (and an overflow, which is not finite) is refused.
     const bool whole = end == token + text.size() && !(errno == ERANGE && value == 0);
-#ifndef _WIN32
-    if (previous)
-        uselocale(previous);
-#endif
     if (!whole)
         return false;
 #endif
